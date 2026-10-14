@@ -1,4 +1,4 @@
-"""Riffo v5 — AI-guided multi-game strategy for UCLA AltruAgent.
+"""Riffo v5.1 — AI-guided multi-game strategy for UCLA AltruAgent.
 
 Drop this file into your project's agent/agent.py.
 Requires the official UCLA starter and an OpenAI-compatible provider in .env.
@@ -64,6 +64,9 @@ class FastRedAlert:
 
     @staticmethod
     def _order_key(order: dict) -> str:
+        if order.get('cmd') in {'attack', 'attack_move'}:
+            # A changing list of unit ids should not reset the attack cooldown.
+            return 'attack:group'
         return f"{order.get('cmd')}:{order.get('item', '')}:{order.get('units', '')}"
 
     def _can_send(self, order: dict, interval: float) -> bool:
@@ -101,7 +104,7 @@ class FastRedAlert:
         # omitted 'at' and chooses a valid placement near the base.
         for p in production:
             item = self._text_type(p.get("item"))
-            if p.get("ready") is True and item:
+            if p.get("ready") is True and item in {"powr","tent","barr","proc","weap","afld","silo","dome","stek","atek","hpad","fix","gun","ftur","tsla","sam","agun","mslo","iron","pdox"}:
                 order = {"cmd": "place", "item": item}
                 if self._can_send(order, 7):
                     return order, f"Placing the completed {item}.", 7
@@ -133,8 +136,8 @@ class FastRedAlert:
                   {"mcv", "harv", "harvester", "truk", "truck", "miner"}]
         attack = legal.get("attack_now")
         if len(combat) >= 4 and isinstance(attack, dict) and attack.get("cmd"):
-            if self._can_send(attack, 18):
-                return attack, "Advancing an assembled force toward the enemy.", 18
+            if self._can_send(attack, 38):
+                return attack, "Advancing an assembled force toward the enemy.", 38
 
         # Produce combat units only when there is basic economic infrastructure.
         if "proc" in names:
@@ -1307,6 +1310,222 @@ class HybridRedAlert(FastRedAlert):
         self._log(f'[riffo] Red Alert: accepted AI plan (utility {score:.1f} vs {local:.1f})')
 
 
+# ---------------------------------------------------------------------------
+# Riffo v5.1 — matchup-aware scoring. Uses only authoritative offered moves.
+# ---------------------------------------------------------------------------
+
+# Gen 9 type chart: attacker -> defender -> multiplier (unspecified = 1).
+_TYPE_CHART = {
+  'normal': {'rock':.5,'steel':.5,'ghost':0},
+  'fire': {'grass':2,'ice':2,'bug':2,'steel':2,'fire':.5,'water':.5,'rock':.5,'dragon':.5},
+  'water': {'fire':2,'ground':2,'rock':2,'water':.5,'grass':.5,'dragon':.5},
+  'electric': {'water':2,'flying':2,'electric':.5,'grass':.5,'dragon':.5,'ground':0},
+  'grass': {'water':2,'ground':2,'rock':2,'fire':.5,'grass':.5,'poison':.5,'flying':.5,'bug':.5,'dragon':.5,'steel':.5},
+  'ice': {'grass':2,'ground':2,'flying':2,'dragon':2,'fire':.5,'water':.5,'ice':.5,'steel':.5},
+  'fighting': {'normal':2,'ice':2,'rock':2,'dark':2,'steel':2,'poison':.5,'flying':.5,'psychic':.5,'bug':.5,'fairy':.5,'ghost':0},
+  'poison': {'grass':2,'fairy':2,'poison':.5,'ground':.5,'rock':.5,'ghost':.5,'steel':0},
+  'ground': {'fire':2,'electric':2,'poison':2,'rock':2,'steel':2,'grass':.5,'bug':.5,'flying':0},
+  'flying': {'grass':2,'fighting':2,'bug':2,'electric':.5,'rock':.5,'steel':.5},
+  'psychic': {'fighting':2,'poison':2,'psychic':.5,'steel':.5,'dark':0},
+  'bug': {'grass':2,'psychic':2,'dark':2,'fire':.5,'fighting':.5,'poison':.5,'flying':.5,'ghost':.5,'steel':.5,'fairy':.5},
+  'rock': {'fire':2,'ice':2,'flying':2,'bug':2,'fighting':.5,'ground':.5,'steel':.5},
+  'ghost': {'psychic':2,'ghost':2,'dark':.5,'normal':0},
+  'dragon': {'dragon':2,'steel':.5,'fairy':0},
+  'dark': {'psychic':2,'ghost':2,'fighting':.5,'dark':.5,'fairy':.5},
+  'steel': {'ice':2,'rock':2,'fairy':2,'fire':.5,'water':.5,'electric':.5,'steel':.5},
+  'fairy': {'fighting':2,'dragon':2,'dark':2,'fire':.5,'poison':.5,'steel':.5},
+}
+_MOVE_POWER_ESTIMATE = {
+  'astralbarrage':120,'glaciallance':120,'surgingstrikes':75,'wickedblow':75,
+  'makeitrain':120,'bleakwindstorm':100,'moonblast':95,'dazzlinggleam':80,
+  'heatwave':95,'rockslide':75,'earthpower':90,'closecombat':120,
+  'flareblitz':120,'woodhammer':120,'wildcharge':90,'playrough':90,
+  'thunderbolt':90,'icebeam':90,'shadowball':80,'energyball':90,
+  'knockoff':65,'grassyglide':55,'tackle':40,'fakeout':40,
+  'hydropump':110,'dracometeor':130,'hypervoice':90,'sludgebomb':90,
+  'earthquake':100,'stompingtantrum':75,'highhorsepower':95,
+  'iciclecrash':85,'ironhead':80,'darkpulse':80,'airslash':75,
+  'bravebird':120,'hurricane':110,'leafstorm':130,
+  'protect':0,'detect':0,'tailwind':0,'trickroom':0,
+  'spore':0,'sleeppowder':0,'followme':0,'ragepowder':0,
+  'helpinghand':0,'partingshot':0,'wideguard':0,
+}
+_MORE_SPECIES_TYPES = {
+  'arcanine':('fire',), 'porygon2':('normal',), 'cresselia':('psychic',),
+  'dialga':('steel','dragon'),'terapagos':('normal',),'regieleki':('electric',),
+  'regidrago':('dragon',),'chienpao':('dark','ice'), 'murkrow':('dark','flying'),
+  'kingambit':('dark','steel'),'ursaring':('normal',), 'ogerponhearthflame':('grass','fire'),
+  'ogerponcornerstone':('grass','rock'), 'ogerponthearthflame':('grass','fire'),
+  'gholdengo':('steel','ghost'), 'ursalunabloodmoon':('ground','normal'),
+  'archaludon':('steel','dragon'),'indeedee':('psychic','normal'),
+  'lando':('ground','flying'),'ironbundle':('ice','water'),
+  'roaringmoon':('dragon','dark'),'walkingwake':('water','dragon'),
+  'chi-yu':('dark','fire'),'chiyu':('dark','fire'),
+}
+
+def _type_multiplier(move_type, target_species):
+    if not move_type:
+        return 1.0
+    target = _name(target_species)
+    defending = _TYPES.get(target) or _MORE_SPECIES_TYPES.get(target)
+    if not defending:
+        return 1.0
+    impact = 1.0
+    for defending_type in defending:
+        impact *= _TYPE_CHART.get(move_type, {}).get(defending_type, 1.0)
+    return impact
+
+
+class MatchupPokemonCoach(PokemonCoach):
+    """Net benefit = pressure, KO potential, setup tempo, safety and type matching.
+
+    These are estimates rather than a full Showdown damage simulator. It never
+    creates a new action: only scores options already offered by the server.
+    """
+    def __init__(self, *, log=print):
+        super().__init__(log=log)
+        self.active_species = {}
+        self.current_target_species = {}
+        self.current_target_hps = {}
+
+    def _score_move(self, option, slot, target, last_target, reserved_setup=None):
+        base = super()._score_move(option, slot, target, last_target, reserved_setup)
+        if option.get('type') != 'move':
+            return base
+        move = _name(option.get('move_id'))
+        move_type = _name(option.get('move_type') or option.get('element') or _MOVE_TYPES.get(move))
+        # Subtract the old, incomplete type bonus (it incorrectly treats resisted
+        # dual-type matchups as pure super-effective damage).
+        if type(target) is int and target > 0:
+            base -= _target_matchup_bonus(option, target)
+        # Do not give a large *fixed* bonus to a move that is immune/resisted.
+        base -= 0.75 * _MOVE_BONUS.get(move, 0)
+        power = option.get('base_power', option.get('power'))
+        if type(power) not in (int, float):
+            power = _MOVE_POWER_ESTIMATE.get(move)
+        if power is None:
+            # A new attack move whose power is unknown should not be scored as
+            # zero; novel status moves get some benefit from the existing policy.
+            power = 60 if move not in _MOVE_BONUS else 0
+        if power > 0:
+            attacker = _name(self.active_species.get(slot, ''))
+            stab = 1.5 if move_type and move_type in (_TYPES.get(attacker) or _MORE_SPECIES_TYPES.get(attacker) or ()) else 1.0
+            multiplier = 1.0
+            if type(target) is int and target > 0:
+                species = next((x.get('species') for x in option.get('target_options', [])
+                                if isinstance(x, dict) and x.get('target') == target), None)
+                species = species or self.current_target_species.get(target)
+                multiplier = _type_multiplier(move_type, species)
+            accuracy = option.get('accuracy', 100)
+            accuracy = accuracy / 100 if type(accuracy) in (int, float) and 0 < accuracy <= 100 else 1.0
+            damage_proxy = float(power) * stab * multiplier * accuracy
+            base += min(170, damage_proxy * 0.72)
+            if multiplier == 0:
+                base -= 180  # Known type immunity: avoid wasting the move.
+            elif multiplier < 1:
+                base -= 25
+            elif multiplier >= 2:
+                base += 14
+            if type(target) is int and target > 0:
+                hp = self.current_target_hps.get(target)
+                if type(hp) in (int,float) and 0 < hp <= 1:
+                    base += 22 * (1-hp) * min(2, multiplier)
+        # Avoid blindly spamming early-game utility with no benefit after setup.
+        if move in {'tailwind', 'trickroom'} and move in self.used_setup:
+            base -= 75
+        if move in {'protect', 'detect'} and self.last_moves.get(slot) in {'protect','detect'}:
+            base -= 50
+        if move in {'explosion', 'selfdestruct', 'memento', 'finalgambit'}:
+            base -= 100
+        return base
+
+
+class MatchupHybridPokemon(HybridPokemon):
+    """AI chooses from matchup-ranked legal alternatives, with local fallback."""
+    def __init__(self, provider, *, log=print):
+        super().__init__(provider, log=log)
+        self.local = MatchupPokemonCoach(log=lambda *_: None)
+        self.drafted_species = []
+
+    def _alternatives(self, state):
+        first = state.legal_actions[0] if state.legal_actions else None
+        if first and first.action_id == 'doubles_turn':
+            template = first.input.get('action') or {}
+            slots = template.get('slots') or []
+            self.local.active_species = {}
+            self.local.current_target_species = {}
+            self.local.current_target_hps = {}
+            for idx, slot in enumerate(slots):
+                if not isinstance(slot, dict):
+                    continue
+                number = slot.get('slot', idx)
+                active = slot.get('active') or {}
+                if isinstance(active, dict):
+                    self.local.active_species[number] = active.get('species', '')
+                for option in slot.get('options') or []:
+                    for target in option.get('target_options') or []:
+                        if isinstance(target, dict) and type(target.get('target')) is int and target['target'] > 0:
+                            self.local.current_target_species[target['target']] = target.get('species', '')
+            candidates = super()._alternatives(state)
+            for candidate in candidates:
+                action = candidate['action']
+                for i in (0, 1):
+                    slot_choice = action.get(f'slot_{i}', {})
+                    if slot_choice.get('type') == 'move':
+                        move = _name(slot_choice.get('move_id'))
+                        target = slot_choice.get('target')
+                        opponent = self.local.current_target_species.get(target, '')
+                        kind = _name(_MOVE_TYPES.get(move))
+                        candidate['description'] += (
+                            f'; slot{i}: {move} on {opponent or target}'
+                            f' (estimated type effectiveness {_type_multiplier(kind, opponent):g}x)')
+            return candidates
+        candidates = super()._alternatives(state)
+        if first and first.action_id.startswith('draft_pick:'):
+            # A team with 3 speed setters is not automatically stronger than
+            # a balanced team. Penalize role redundancy once a role is filled.
+            have_speed = any(_name(x) in {'tornadus','whimsicott','murkrow'} for x in self.drafted_species)
+            have_fakeout = any(_name(x) in {'incineroar','rillaboom','ironhands'} for x in self.drafted_species)
+            for candidate in candidates:
+                action = candidate['action']
+                obs = state.raw.get('observation') or {}
+                cards = obs.get('available_cards') or []
+                card = next((x for x in cards if isinstance(x, dict) and str(x.get('card_id')) == action.action_id.partition(':')[2]), {})
+                species = card.get('species') or action.label or ''
+                key = _name(species)
+                if key in {'tornadus','whimsicott','murkrow'} and not have_speed:
+                    candidate['utility'] += 9
+                if key in {'tornadus','whimsicott','murkrow'} and have_speed:
+                    candidate['utility'] -= 12
+                if key in {'incineroar','rillaboom','ironhands'} and not have_fakeout:
+                    candidate['utility'] += 6
+                candidate['description'] += f'; existing team={self.drafted_species}'
+            return sorted(candidates, key=lambda row: -row['utility'])
+        return candidates
+
+    def choose_action(self, state, context):
+        answer = super().choose_action(state, context)
+        if state.legal_actions and state.legal_actions[0].action_id.startswith('draft_pick:'):
+            chosen = answer.action if isinstance(answer, WithReasoning) else answer
+            label = chosen.action_id if hasattr(chosen, 'action_id') else str(chosen)
+            obs = state.raw.get('observation') if isinstance(state.raw, dict) else {}
+            cards = obs.get('available_cards') or [] if isinstance(obs, dict) else []
+            card = next((x for x in cards if isinstance(x, dict) and str(x.get('card_id')) == label.partition(':')[2]), {})
+            species = card.get('species') or getattr(chosen, 'label', None)
+            if species and species not in self.drafted_species:
+                self.drafted_species.append(species)
+        action = answer.action if isinstance(answer, WithReasoning) else answer
+        if isinstance(action, dict) and action.get('type') == 'doubles_turn':
+            moves = []
+            for slot_num in (0, 1):
+                chosen = action.get(f'slot_{slot_num}', {})
+                moves.append(f"slot{slot_num}={chosen.get('move_id', chosen.get('species', chosen.get('type')))} target={chosen.get('target', '-')}")
+            self.log('[riffo] Pokemon selected: ' + ', '.join(moves))
+        elif hasattr(action, 'action_id') and str(action.action_id).startswith('draft_pick:'):
+            self.log('[riffo] Pokemon draft picked ' + str(getattr(action, 'label', None) or action.action_id))
+        return answer
+
+
 class RiffoAgent:
     """UCLA SDK entry point; one isolated instance per assigned game seat."""
 
@@ -1314,7 +1533,7 @@ class RiffoAgent:
         load_dotenv()
         self.provider = ResilientProvider(provider if provider is not None else provider_from_env())
         self.log = log
-        self.pokemon = HybridPokemon(self.provider, log=log)
+        self.pokemon = MatchupHybridPokemon(self.provider, log=log)
         self.werewolf = HybridWerewolf(self.provider, log=log)
         self.red_alert = HybridRedAlert(self.provider, log=log)
 
