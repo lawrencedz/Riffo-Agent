@@ -1,75 +1,89 @@
-# Riffo Agent — UCLA AltruAgent Tournament
+# Riffo 6.3 — cumulative pre-tournament package
 
-Riffo is a self-hosted, three-game AI agent built on the official UCLA AltruAgent starter kit. It plays **Pokémon VGC doubles draft**, **Werewolf**, and **Red Alert** using a hybrid of structured LLM decisions and deterministic strategies.
+Includes v6.1 model-led Pokémon and evidence-driven Werewolf, **v6.2 Red Alert economic throughput fix**, plus small v6.3 Pokémon battle-mechanics checks. You need only **this ZIP**; do not install earlier versions first.
 
-> **Status:** Experimental v2. Local strategy tests can pass without demonstrating game wins. Validate at least one live Testing match before relying on it competitively.
+## Why this change
 
-## Strategy
+The latest battle against Abu Bakar Siddik revealed two strong, game-mechanics errors:
 
-| Game | Agent approach | Why |
-|---|---|---|
-| Pokémon VGC doubles | Groq LLM with game-specific draft, team-preview, and battle advice | Uses UCLA's legal-action adapters and Showdown timer fallbacks |
-| Werewolf | Role-aware Groq LLM | Accounts for investigations, voting, hidden roles, and team objectives |
-| Red Alert | Immediate deterministic build/attack rules + up to 12 short Groq calls per match | Handles real-time constraints and reduces API usage |
+- **Turn 4:** Rillaboom selected **Fake Out** against Hatterene after remaining on the field since Turn 1. Fake Out fails when the user did not just enter the field.
+- **Turns 6 and 7:** Iron Bundle selected **Protect** on two consecutive turns. The second consecutive Protect attempt is much less likely to succeed (approximately 1/3 in standard Gen 9 mechanics), so the bot must explicitly weigh that risk rather than treating it as reliable protection.
 
-The contest server remains the authority on valid moves. This project intentionally relies on the starter's `examples/llm_agent.py`, `examples/llm/pokemon.py`, and `examples/llm/redalert.py` for structured action validation and game integration.
+The opening double-Fake-Out decision is also risky when both leads can be heavily damaged if Fake Out does not cause a flinch; we do **not** know from the displayed action history whether the first turn's Fake Outs failed, which items/abilities were active, or exactly how damage resolved.
 
-## Set up (Windows PowerShell)
+## Technical changes
 
-Run commands in the folder containing `pyproject.toml`, which must also have `agent/`, `altruagent/`, and `examples/`.
+- Tracks which *observed active species* occupied slot 0 and slot 1 across consecutive battle decisions. Unknown, fainted, or replaced slots do not inherit a previous Pokémon's state.
+- Adds model-visible, factual warnings for a **non-fresh Fake Out** or **back-to-back Protect/Detect**. All server legal options remain visible; no static species rankings or arbitrary score tables have been added.
+- When an LLM still chooses one of these risky moves, requests **one additional model correction** (up to 4.5 seconds) *only if* the battle-decision budget permits. The server-valid original is retained if correction times out or fails. This deliberately does not guarantee improved tactical performance when the LLM API is unavailable.
+- Explicitly encourages comparing opponent Trick Room and Tailwind plans at preview, and treats double Fake Out as a contingent tactic rather than guaranteed protection.
+- **Werewolf remains unchanged**: fully model-led role-sensitive evidence discussion, reliable wolf-teammate protection, and official legal-action validation.
+- **Red Alert remains v6.2**: nonblocking high-level model strategy, economic reinvestment, timely order batches, per-order diagnostics.
 
-```powershell
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-```
+## PowerShell install (Windows)
 
-Place these settings in **`.env`** (never commit or upload that file):
-
-```dotenv
-ALTRUAGENT_CONTROL_URL=https://api.altruagent-game.com
-ALTRUAGENT_OFFICIAL_AGENT_KEY=eak_live_YOUR_PRIVATE_KEY
-OPENAI_API_KEY=YOUR_PRIVATE_GROQ_KEY
-OPENAI_MODEL=openai/gpt-oss-20b
-OPENAI_BASE_URL=https://api.groq.com/openai/v1
-```
-
-`OPENAI_API_KEY` refers to Groq because the starter uses an OpenAI-compatible API interface.
-
-## Check and play
+Stop the existing agent (Ctrl+C) and **download the ZIP**. The commands assume Downloads is your browser's download location:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q tests/test_riffo_agent.py
+cd "C:\Users\larry\OneDrive\Documents\Riffo Agent\Riffo-Agent"
+$zip = "$HOME\Downloads\Riffo-Agent-v6_3-complete-final.zip"
+$patch = "$env:TEMP\riffo-v63"
+if (!(Test-Path $zip)) { throw "Download the v6.3 ZIP to Downloads first." }
+Expand-Archive -LiteralPath $zip -DestinationPath $patch -Force
+Copy-Item .\agent\agent.py "$env:TEMP\riffo-before-v63.py" -Force
+Copy-Item "$patch\agent\agent.py" .\agent\agent.py -Force
+foreach ($n in @('test_riffo_v60.py','test_riffo_v61.py','test_riffo_v62.py','test_riffo_v63.py')) {
+    Copy-Item "$patch\tests\$n" ".\tests\$n" -Force
+}
+Copy-Item "$patch\scripts\setup_pokemon_reference.py" .\scripts\setup_pokemon_reference.py -Force
+.\.venv\Scripts\python.exe -m py_compile .\agent\agent.py
+.\.venv\Scripts\python.exe -m pytest -q tests/test_riffo_v60.py tests/test_riffo_v61.py tests/test_riffo_v62.py tests/test_riffo_v63.py
 .\.venv\Scripts\python.exe -m agent --check-tournament
-.\.venv\Scripts\python.exe -m agent --match
 ```
 
-Create a game on the [Testing page](https://platform.altruagent-game.com/tournament/dashboard) with seats set to **Mine (self-hosted)**. The agent should say it has connected and is waiting for an assignment. That alone does not show that the Groq API works: inspect live decisions and the finished match.
+The four focused test files passed **30/30 in an offline stubbed SDK harness**, not in a live UCLA match. Expect `30 passed` under compatible dependencies. The `--check-tournament` step needs live platform access and a valid tournament key.
 
-To play both test and tournament games, launch **one process**:
+### Optional reference setup
+
+Once per hosting machine (only if the reference JSON isn't already present):
 
 ```powershell
-.\.venv\Scripts\python.exe -m agent --tournament --match
+.\.venv\Scripts\python.exe .\scripts\setup_pokemon_reference.py
 ```
 
-Register on the dashboard, keep the terminal and computer running during the scheduled tournament, and stop using `Ctrl+C` when appropriate.
+This downloads public Pokémon Showdown move/species data and saves `agent/pokemon_reference.json` locally. This reference is not included in this ZIP. Do not assume the model has verified typings/move powers until the script succeeds. Copy the JSON to your continuously online hosting computer if that computer cannot download it.
 
-## Safety and cost
+### Roll back
 
-- Rotate any keys that have appeared in screenshots or chats; save replacements only in local `.env`.
-- `.env`, variants of `.env`, and `.venv` must be ignored by Git.
-- A live Pokémon or Werewolf match consumes Groq calls. Red Alert normally uses rules and caps AI requests at 12 per match, up to eight seconds each.
-- Groq free-tier rate limits and model response issues can still cause fallbacks. Watch console logs for `HTTP 400` / `429` and `[llm] ... FALLBACK`.
+```powershell
+Copy-Item "$env:TEMP\riffo-before-v63.py" .\agent\agent.py -Force
+```
 
-## Development
+### Commit safely
 
-- `agent/agent.py`: Riffo's strategy orchestration.
-- `tests/test_riffo_agent.py`: offline strategy and wiring tests.
-- `agent/__main__.py`: official starter entry point (unchanged).
-- `examples/` and `altruagent/`: the original tournament SDK and game adapters (unchanged).
+Confirm `.env` is **not tracked**, and no secrets have ever entered Git history before pushing:
 
-## Evaluation priorities
+```powershell
+git ls-files .env
+git log --all --format= --name-only -- .env
+# If either command outputs .env, STOP and address the exposed credentials.
+git add agent/agent.py tests/test_riffo_v60.py tests/test_riffo_v61.py tests/test_riffo_v62.py tests/test_riffo_v63.py scripts/setup_pokemon_reference.py
+git diff --cached --name-only
+git commit -m "Riffo v6.3 AI-first cumulative tournament update"
+git push -u origin main
+```
 
-1. Verify a self-hosted **Werewolf** match reaches completion.
-2. Verify Pokémon **draft → team preview → doubles battle** completes without errors or timer forfeits.
-3. Inspect Red Alert logs and refine build orders after actual observations.
-4. Record win rates, decision times, invalid actions, and Groq API errors. None of these are validated by offline tests alone.
+A GitHub push **does not start the runner**. Self-hosted tournament play requires a computer that stays online, registered on the platform, running **one** copy of:
+
+```powershell
+.\.venv\Scripts\python.exe -m agent --tournament
+```
+
+On a Linux cloud VM use `./.venv/bin/python -m agent --tournament` instead. If your laptop will disconnect tomorrow, install and start this version on the always-online machine before you leave.
+
+## Limitations and priorities
+
+- No v6.3 live win-rate evidence. The new Pokemon tracking is best-effort and depends on the real template exposing the active species. If not present, it will not guess.
+- No changes to the server, game rules, or user's .env/API keys.
+- The optional correction adds a model call only when it sees a severe tactical choice and time remains; if that fails, the previously validated legal choice is returned.
+- Most urgent: verify test passes, actual platform readiness, internet-connected hosting, and what code version is loaded before the tournament.
