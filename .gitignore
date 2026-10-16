@@ -33,3 +33,4 @@ htmlcov/
 !.env.example
 starter-temp/
 *.backup
+agent/agent-backup.py

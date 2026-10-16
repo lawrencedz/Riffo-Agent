@@ -1,4 +1,4 @@
-"""Riffo 6.3: grounded VGC mechanics, genuine Werewolf, and responsive RTS macro.
+"""Riffo 6.3.1: grounded VGC, evidence-led Werewolf, and RTS economy recovery.
 
 Designed for the UCLA AltruAgent starter. The server's legal choices, private
 seat observation and game configuration are authoritative. No embedded keys.
@@ -260,7 +260,7 @@ class FastRedAlert:
                     "threaten the base, defend immediately. Do not waste troops or send harvesters into combat. "
                     "Use only observed facts; respond with strict JSON.")},
                 {"role": "user", "content": _json(payload, 9500)},
-            ], "riffo_rts_strategy", schema, timeout=3.0)
+            ], "riffo_rts_strategy", schema, timeout=7.0)
             self.strategy_results.put(ans)
         except (ProviderError, ValueError, TypeError, KeyError, TimeoutError) as exc:
             self.strategy_results.put({"error": type(exc).__name__})
@@ -279,9 +279,9 @@ class FastRedAlert:
             if ans.get("priority") in ("economy", "infantry", "armor"):
                 self.priority = ans["priority"]
             if "error" in ans:
-                self.log("[riffo6.2] RTS strategist unavailable; macro runs independently")
+                self.log("[riffo6.3.1] RTS strategist unavailable; macro runs independently")
             else:
-                self.log(f"[riffo6.2] RTS strategy={self.strategy}, priority={self.priority}")
+                self.log(f"[riffo6.3.1] RTS strategy={self.strategy}, priority={self.priority}")
         if (self.strategy_busy or self.ai_calls >= self.ai_limit or
                 self.clock() - self.last_ai < 40):
             return
@@ -312,13 +312,13 @@ class FastRedAlert:
                         str(r.get("status", "")).lower() in ("rejected", "failed", "invalid", "error", "denied") or
                         str(r.get("reason", "")).lower() not in ("", "ok", "success", "accepted")]
             if rejected:
-                self.log("[riffo6.2] RTS per-order results: " + _json(rejected[:5], 700))
+                self.log("[riffo6.3.1] RTS per-order results: " + _json(rejected[:5], 700))
         problems = _rows(raw.get("recent_order_problems"))
         if problems:
             signature = _json(problems[-3:], 900)
             if signature != self.last_problem_signature:
                 self.last_problem_signature = signature
-                self.log("[riffo6.2] RTS recent order problems: " + signature)
+                self.log("[riffo6.3.1] RTS recent order problems: " + signature)
 
     def choose_action(self, state: Any, context: Any):
         raw = _dict(getattr(state, "raw", {}))
@@ -392,14 +392,21 @@ class FastRedAlert:
             critical = "proc" if "proc" in available else None
         elif power > 0 and drain >= power and "powr" in available and not has("apwr"):
             critical = "powr"
-        elif refineries < 2 and "proc" in available and not enemy_close:
-            # OpenRA double-refinery opening: queue refinery as soon as it is
-            # affordable. Save rather than divert its capital into the factory.
-            critical = "proc"
-        elif factories == 0:
-            critical = "weap" if "weap" in available else None
+        elif factories == 0 and "weap" in available:
+            # Factory before the SECOND refinery. In a short RTS match, sinking
+            # all starting cash into a second refinery can leave us at $100
+            # with no armor, no queue and no income if trucks are slow/stuck.
+            critical = "weap"
         elif refineries < 2 and "proc" in available:
-            critical = "proc"
+            # Check near-term power BEFORE adding another power-draining refinery.
+            # Red Alert refinery consumption is usually 30, but only the live
+            # observed power data is authoritative about our existing headroom.
+            if power > 0 and power - drain < 30 and "powr" in available:
+                critical = "powr"
+            elif not enemy_close:
+                critical = "proc"
+            else:
+                critical = "proc"
         elif power > 0 and drain >= power * 0.94 and "powr" in available:
             critical = "powr"
         elif refineries >= 2 and factories >= 1 and count("barr")+count("tent") < 2 and cash >= 2500:
@@ -431,10 +438,12 @@ class FastRedAlert:
         reserve = 0
         if refineries == 0:
             reserve = self._cost("proc", context)
+        elif factories == 0:
+            # Preserve the WHOLE vehicle-factory cost; do not buy infantry with
+            # the last $300 needed to fund the next tech building.
+            reserve = self._cost("weap", context)
         elif refineries < 2:
             reserve = self._cost("proc", context)
-        elif factories == 0:
-            reserve = min(self._cost("weap", context), 1700)
         # A nearby attack takes precedence over saving everything for growth.
         if nearby and len(combat) < 7:
             reserve = min(reserve, 300)
@@ -484,8 +493,12 @@ class FastRedAlert:
 
         if self.clock() - self.last_status > 15:
             self.last_status = self.clock()
-            self.log(f"[riffo6.2] RTS cash={int(cash)} power={int(power)}/{int(drain)} "
+            harv_diag = [{"id":h.get("id"), "idle":h.get("idle", "unknown"),
+                          "cell":h.get("cell"), "order":h.get("order", h.get("activity"))}
+                         for h in harvesters[:3]]
+            self.log(f"[riffo6.3.1] RTS cash={int(cash)} power={int(power)}/{int(drain)} "
                      f"buildings={','.join(names)} military={len(combat)} harvesters={len(harvesters)} "
+                     f"harvester_state={_json(harv_diag, 350)} "
                      f"queue={','.join(queued)} available={','.join(sorted(available))}")
         return self._send(orders, context, f"RTS {self.strategy}: {self.priority}") if orders else WAIT
 
@@ -503,7 +516,7 @@ class FastRedAlert:
                 cd = 5
             self.cooldowns[self._key(order)] = now + cd
         self.last_batch = valid
-        self.log(f"[riffo6.2] RTS sent: " + "; ".join(f"{o['cmd']} {o.get('item', '')}{' x'+str(o['count']) if o.get('count') else ''}" for o in valid))
+        self.log(f"[riffo6.3.1] RTS sent: " + "; ".join(f"{o['cmd']} {o.get('item', '')}{' x'+str(o['count']) if o.get('count') else ''}" for o in valid))
         return WithReasoning({"type": "orders", "orders": valid}, reason)
 
     def on_action_result(self, result: dict, context: Any):

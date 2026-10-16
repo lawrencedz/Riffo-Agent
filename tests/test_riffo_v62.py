@@ -4,22 +4,22 @@ from agent.agent import FastRedAlert
 from test_riffo_v60 import Model, C, rstate, cmds
 
 
-def test_second_refinery_before_factory_in_safe_opening():
+def test_factory_before_second_refinery_in_safe_opening():
     p = FastRedAlert(Model(), log=lambda *_: None)
     s = rstate(buildings=['fact','powr','barr','proc'], cash=2100,
                available=['proc','weap','e1'])
     orders = cmds(p.choose_action(s, C('red_alert')))
-    assert {'cmd':'build','item':'proc'} in orders, orders
-    assert not any(o.get('item')=='weap' for o in orders), orders
+    assert {'cmd':'build','item':'weap'} in orders, orders
+    assert not any(o.get('item')=='proc' for o in orders), orders
     assert not any(o['cmd']=='train' for o in orders), 'Do not use second-refinery savings on excess infantry'
 
 
-def test_wait_for_second_refinery_capital_instead_of_buying_factory():
+def test_wait_for_factory_capital_instead_of_burning_cash():
     p = FastRedAlert(Model(), log=lambda *_: None)
     s = rstate(buildings=['fact','powr','barr','proc'], cash=1800,
                available=['proc','weap','e1'])
     orders = cmds(p.choose_action(s, C('red_alert')))
-    assert not any(o.get('item')=='weap' for o in orders), orders
+    assert not any(o.get('item')=='proc' for o in orders), orders
     assert not any(o['cmd']=='train' for o in orders), orders
 
 
