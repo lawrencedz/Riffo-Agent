@@ -1,2035 +1,901 @@
-"""Riffo v5.2 — AI-guided multi-game strategy for UCLA AltruAgent.
+"""Riffo 6.3: grounded VGC mechanics, genuine Werewolf, and responsive RTS macro.
 
-Drop this file into your project's agent/agent.py.
-Requires the official UCLA starter and an OpenAI-compatible provider in .env.
-Uses cost/benefit heuristics to propose legal actions and GPT-4o mini to
-compare them, with safe local fallbacks in Pokémon, Werewolf and Red Alert.
-No API credentials belong in this file.
+Designed for the UCLA AltruAgent starter. The server's legal choices, private
+seat observation and game configuration are authoritative. No embedded keys.
 """
 from __future__ import annotations
 
 import json
+import os
+import queue
 import re
+import threading
 import time
+from collections import Counter
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 from altruagent import WAIT, WithReasoning, SendMessage, TERMINATE_MESSAGING
-from examples.llm_agent import LLMAgent
-from examples.llm.providers import provider_from_env
-from examples.llm.redalert import RedAlertPlayer
-from examples import smoke_agent
-from examples.llm.providers import ProviderError
-
-
-class ShortTimeoutProvider:
-    """Limit Red Alert model calls to eight seconds, even without an explicit clock."""
-
-    def __init__(self, provider):
-        self._provider = provider
-        self.model = provider.model
-
-    def complete_structured(self, messages, schema_name, schema, *, timeout=None):
-        limit = min(8.0, timeout) if timeout is not None else 8.0
-        return self._provider.complete_structured(messages, schema_name, schema, timeout=limit)
-
-
-class FastRedAlert:
-    """Low-cost realtime commander: deterministic micro + occasional model planning.
-
-    This is the base real-time commander; HybridRedAlert adds utility-based
-    AI plan comparisons. These limits are configurable in the subclass.
-    """
-
-    MAX_LLM_CALLS = 4
-    LLM_INTERVAL = 150.0
-
-    def __init__(self, provider, *, log=print, clock=time.monotonic):
-        self._llm = RedAlertPlayer(ShortTimeoutProvider(provider), log=log, max_calls=self.MAX_LLM_CALLS, clock=clock)
-        self._log = log
-        self._clock = clock
-        self._last_llm = clock()
-        self._sent_at: dict[str, float] = {}
-        self._last_order_key: str | None = None
-        self._last_was_llm = False
-        self._rejected_until: dict[str, float] = {}
-
-    @staticmethod
-    def _objects(value) -> list[dict]:
-        return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
-
-    @staticmethod
-    def _text_type(value) -> str:
-        return str(value or "").lower()
-
-    @staticmethod
-    def _order_key(order: dict) -> str:
-        if order.get('cmd') in {'attack', 'attack_move'}:
-            # A changing list of unit ids should not reset the attack cooldown.
-            return 'attack:group'
-        return f"{order.get('cmd')}:{order.get('item', '')}:{order.get('units', '')}"
-
-    def _can_send(self, order: dict, interval: float) -> bool:
-        key = self._order_key(order)
-        now = self._clock()
-        return (
-            now - self._sent_at.get(key, float("-inf")) >= interval
-            and now >= self._rejected_until.get(key, 0)
-        )
-
-    def _heuristic(self, raw: dict) -> tuple[dict, str, float] | None:
-        obs = raw.get("observation")
-        if not isinstance(obs, dict):
-            return None
-        units = self._objects(obs.get("units"))
-        buildings = self._objects(obs.get("buildings"))
-        production = self._objects(obs.get("production"))
-        available = {
-            str(v).lower() for v in (obs.get("available_production") or [])
-            if isinstance(v, str)
-        }
-        names = [self._text_type(b.get("type")) for b in buildings]
-        queued = [self._text_type(p.get("item")) for p in production]
-        legal = raw.get("legal_actions")
-        legal = legal if isinstance(legal, dict) else {}
-
-        # Deploy only a currently existing MCV. Never reuse the old unit ID.
-        for unit in units:
-            if self._text_type(unit.get("type")) == "mcv" and type(unit.get("id")) is int:
-                order = {"cmd": "deploy", "units": [unit["id"]]}
-                if self._can_send(order, 7):
-                    return order, "Deploying the MCV to unlock construction.", 7
-
-        # Placing a ready structure unblocks the build queue. The game accepts
-        # omitted 'at' and chooses a valid placement near the base.
-        for p in production:
-            item = self._text_type(p.get("item"))
-            if p.get("ready") is True and item in {"powr","tent","barr","proc","weap","afld","silo","dome","stek","atek","hpad","fix","gun","ftur","tsla","sam","agun","mslo","iron","pdox"}:
-                order = {"cmd": "place", "item": item}
-                if self._can_send(order, 7):
-                    return order, f"Placing the completed {item}.", 7
-
-        economy = obs.get("economy")
-        economy = economy if isinstance(economy, dict) else {}
-        power = economy.get("power_provided")
-        drained = economy.get("power_drained")
-        if (isinstance(power, (int, float)) and isinstance(drained, (int, float))
-                and power < drained and "powr" in available and "powr" not in queued):
-            order = {"cmd": "build", "item": "powr"}
-            if self._can_send(order, 12):
-                return order, "Restoring power capacity.", 12
-
-        # Avoid duplicate queued structures and honor available production.
-        # The two barracks names depend on faction.
-        for options in (("powr",), ("tent", "barr"), ("proc",), ("weap",)):
-            if any(t in names for t in options) or any(t in queued for t in options):
-                continue
-            item = next((t for t in options if t in available), None)
-            if item:
-                order = {"cmd": "build", "item": item}
-                if self._can_send(order, 12):
-                    return order, f"Building {item} to develop the base.", 12
-
-        # Respond to an authoritative, ready-to-send attack order when there
-        # is a meaningful group of combat units; don't attack with harvesters.
-        combat = [u for u in units if self._text_type(u.get("type")) not in
-                  {"mcv", "harv", "harvester", "truk", "truck", "miner"}]
-        attack = legal.get("attack_now")
-        if len(combat) >= 4 and isinstance(attack, dict) and attack.get("cmd"):
-            if self._can_send(attack, 38):
-                return attack, "Advancing an assembled force toward the enemy.", 38
-
-        # Produce combat units only when there is basic economic infrastructure.
-        if "proc" in names:
-            priority = ("3tnk", "2tnk", "1tnk", "e1")
-            for item in priority:
-                if item in available:
-                    order = {"cmd": "train", "item": item, "count": 2}
-                    if self._can_send(order, 18):
-                        return order, f"Training {item} to strengthen the army.", 18
-        return None
-
-    def choose_action(self, state, context):
-        raw = state.raw
-        if not isinstance(raw.get("observation"), dict):
-            return WAIT
-        now = self._clock()
-        # Never block an immediate, deterministic order waiting for the LLM.
-        heuristic = self._heuristic(raw)
-        if heuristic is not None:
-            order, reason, interval = heuristic
-            key = self._order_key(order)
-            self._sent_at[key] = self._clock()
-            self._last_order_key = key
-            self._last_was_llm = False
-            self._log(f"[riffo] Red Alert: {reason}")
-            return WithReasoning({"type": "orders", "orders": [order]}, reason)
-        # The model advises only when there is no immediately actionable rule.
-        # A short request timeout prevents AI latency from dominating realtime play.
-        if now - self._last_llm >= self.LLM_INTERVAL and self._llm.calls < self.MAX_LLM_CALLS:
-            self._last_llm = now
-            action = self._llm.choose_action(state, context)
-            if action is not WAIT:
-                self._last_was_llm = True
-                return action
-        return WAIT
-
-    def on_action_result(self, result, context):
-        if self._last_was_llm:
-            self._llm.on_action_result(result, context)
-        elif self._last_order_key and (
-            result.get("error") == "INVALID_ACTION" or
-            result.get("accepted") is False
-        ):
-            self._rejected_until[self._last_order_key] = self._clock() + 30
-        self._last_order_key = None
-
-
-
-# Pokémon legal action templates are authoritative. Our local tactical policy
-# always selects among those legal options; it never guesses a Showdown command.
-# No API requests are needed during Pokémon, so it cannot hit Groq 429 / 413.
-_PKM_PRIORITY = {
-    "calyrexshadow": 112, "calyrexice": 106, "fluttermane": 108,
-    "incineroar": 104, "urshifurapidstrike": 103, "urshifusinglestrike": 101,
-    "rillaboom": 101, "tornadus": 100, "ogerponwellspring": 100,
-    "amoonguss": 97, "landorustherian": 97, "chienpao": 97,
-    "ironhands": 95, "dialga": 95, "kyogre": 95, "groudon": 95,
-    "whimsicott": 94, "indeedeef": 93, "farigiraf": 92,
-    "kingambit": 91, "gholdengo": 91, "dragonite": 90,
-    "pelipper": 88, "archaludon": 91, "ursalunabloodmoon": 92,
-    "garchomp": 87, "galarianmoltres": 87, "arcanine": 86,
-    "regieleki": 88, "regidrago": 87, "heatran": 89,
-    "porygon2": 89, "cresselia": 88, "murkrow": 85,
-    "terapagos": 102, "zamazenta": 99, "miraidon": 105, "koraidon": 103,
-}
-
-_MOVE_BONUS = {
-    "fakeout": 65, "tailwind": 80, "spore": 91, "sleeppowder": 65,
-    "followme": 63, "ragepowder": 63, "icywind": 67,
-    "electroweb": 61, "snarl": 53, "partingshot": 66,
-    "knockoff": 55, "helpinghand": 45, "trickroom": 57,
-    "willowisp": 53, "thunderwave": 47,
-    "surgingstrikes": 93, "wickedblow": 90,
-    "astralbarrage": 87, "glaciallance": 87,
-    "dazzlinggleam": 53, "heatwave": 54, "rockslide": 56,
-    "makeitrain": 76, "bleakwindstorm": 73,
-    "closecombat": 67, "headlongrush": 71, "earthpower": 56,
-    "moonblast": 61, "flareblitz": 64, "woodhammer": 59,
-    "wildcharge": 55, "playrough": 56,
-    "uturn": 44, "voltswitch": 44,
-    "protect": 15, "detect": 15, "wideguard": 30,
-    "calmmind": 31, "swordsdance": 32, "nastyplot": 32,
-}
-
-# Known species and move types improve targeting without requiring an API call.
-# Unknown species or moves are treated neutrally rather than guessed.
-_TYPES = {
-    "incineroar": ("fire", "dark"), "tornadus": ("flying",),
-    "rillaboom": ("grass",), "indeedeef": ("psychic", "normal"),
-    "fluttermane": ("ghost", "fairy"), "urshifurapidstrike": ("fighting", "water"),
-    "urshifusinglestrike": ("fighting", "dark"),
-    "amoonguss": ("grass", "poison"), "landorustherian": ("ground", "flying"),
-    "chienpao": ("dark", "ice"), "ironhands": ("electric", "fighting"),
-    "farigiraf": ("normal", "psychic"), "gholdengo": ("steel", "ghost"),
-    "kingambit": ("dark", "steel"), "dragonite": ("dragon", "flying"),
-    "pelipper": ("water", "flying"), "archaludon": ("steel", "dragon"),
-    "heatran": ("fire", "steel"), "kyogre": ("water",),
-    "groudon": ("ground",), "calyrexshadow": ("psychic", "ghost"),
-    "calyrexice": ("psychic", "ice"), "miraidon": ("electric", "dragon"),
-    "koraidon": ("fighting", "dragon"), "zamazenta": ("fighting",),
-    "ogerponwellspring": ("grass", "water"), "garchomp": ("dragon", "ground"),
-    "whimsicott": ("grass", "fairy"), "ursalunabloodmoon": ("ground", "normal"),
-}
-_MOVE_TYPES = {
-    "moonblast": "fairy", "dazzlinggleam": "fairy", "playrough": "fairy",
-    "surgingstrikes": "water", "hydropump": "water", "waterfall": "water",
-    "muddywater": "water", "scald": "water", "originpulse": "water",
-    "heatwave": "fire", "flareblitz": "fire", "flamethrower": "fire",
-    "overheat": "fire", "fireblast": "fire",
-    "woodhammer": "grass", "grassyglide": "grass", "leafstorm": "grass",
-    "powerwhip": "grass", "energyball": "grass",
-    "closecombat": "fighting", "drainpunch": "fighting", "sacredsword": "fighting",
-    "wickedblow": "dark", "knockoff": "dark", "darkpulse": "dark",
-    "astralbarrage": "ghost", "shadowball": "ghost", "shadowclaw": "ghost",
-    "glaciallance": "ice", "icebeam": "ice", "blizzard": "ice",
-    "freezedry": "ice", "iciclecrash": "ice",
-    "earthpower": "ground", "earthquake": "ground", "headlongrush": "ground",
-    "stompingtantrum": "ground", "highhorsepower": "ground",
-    "thunderbolt": "electric", "electroweb": "electric", "wildcharge": "electric",
-    "thunderclap": "electric", "discharge": "electric",
-    "makeitrain": "steel", "flashcannon": "steel", "ironhead": "steel",
-    "rockslide": "rock", "stoneedge": "rock", "powergem": "rock",
-    "bleakwindstorm": "flying", "hurricane": "flying", "bravebird": "flying",
-    "sludgebomb": "poison", "sludgewave": "poison",
-    "psychic": "psychic", "psyshock": "psychic", "expandingforce": "psychic",
-    "dragonpulse": "dragon", "dracometeor": "dragon", "dragonclaw": "dragon",
-    "fakeout": "normal", "extremespeed": "normal", "hypervoice": "normal",
-}
-_SUPER_EFFECTIVE = {
-    "fire": {"grass", "ice", "bug", "steel"},
-    "water": {"fire", "ground", "rock"},
-    "grass": {"water", "ground", "rock"},
-    "electric": {"water", "flying"},
-    "ice": {"grass", "ground", "flying", "dragon"},
-    "fighting": {"normal", "ice", "rock", "dark", "steel"},
-    "ground": {"fire", "electric", "poison", "rock", "steel"},
-    "fairy": {"fighting", "dragon", "dark"},
-    "ghost": {"ghost", "psychic"},
-    "dark": {"ghost", "psychic"},
-    "rock": {"fire", "ice", "flying", "bug"},
-    "steel": {"ice", "rock", "fairy"},
-    "flying": {"grass", "fighting", "bug"},
-    "poison": {"grass", "fairy"},
-    "psychic": {"fighting", "poison"},
-    "dragon": {"dragon"},
-}
-_IMMUNE = {
-    "electric": {"ground"}, "ground": {"flying"},
-    "normal": {"ghost"}, "fighting": {"ghost"},
-    "ghost": {"normal"}, "psychic": {"dark"},
-    "dragon": {"fairy"}, "poison": {"steel"},
-}
-
-
-def _target_matchup_bonus(option: dict, target: int) -> float:
-    move_type = _name(option.get("move_type") or option.get("element") or _MOVE_TYPES.get(_name(option.get("move_id"))))
-    if not move_type:
-        return 0.0
-    target_options = option.get("target_options")
-    if not isinstance(target_options, list):
-        return 0.0
-    species = next((item.get("species") for item in target_options
-                    if isinstance(item, dict) and item.get("target") == target), None)
-    types = _TYPES.get(_name(species))
-    if not types:
-        return 0.0
-    if any(t in _IMMUNE.get(move_type, set()) for t in types):
-        return -200.0
-    multiplier = sum(t in _SUPER_EFFECTIVE.get(move_type, set()) for t in types)
-    return multiplier * 26.0
-
-
-_SINGLE_USE_EARLY = {"tailwind", "trickroom"}
-_SUPPORT_ALLY = {"helpinghand", "coaching", "pollenpuff", "decorate", "healpulse"}
-_SPREAD = {"heatwave", "dazzlinggleam", "rockslide", "muddywater", "blizzard", "snarl", "icywind", "astralbarrage", "glaciallance", "makeitrain", "bleakwindstorm"}
-_AVOID = {"explosion", "selfdestruct", "memento", "finalgambit", "perishsong"}
-
-
-def _name(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
-
-
-def _species_score(species: Any) -> float:
-    key = _name(species)
-    if key in _PKM_PRIORITY:
-        return _PKM_PRIORITY[key]
-    # Card pools can label forms with suffixes; value remains a rough ranking.
-    for prefix, score in _PKM_PRIORITY.items():
-        if key.startswith(prefix):
-            return score - 2
-    return 60.0
-
-
-class PokemonCoach:
-    """Deterministic, near-instant Pokémon policy with server-validated moves."""
-
-    def __init__(self, *, log=print):
-        self.turn = 0
-        self.used_setup: set[str] = set()
-        self.last_moves: dict[int, str] = {}
-        self.log = log
-
-    @staticmethod
-    def _template(action, kind):
-        item = action.input.get("action")
-        if not isinstance(item, dict) or item.get("type") != kind:
-            raise ValueError("Unexpected Pokémon legal-action template")
-        return item
-
-    def _draft(self, state):
-        obs = state.raw.get("observation")
-        obs = obs if isinstance(obs, dict) else {}
-        pool = obs.get("available_cards")
-        card_by_id = {
-            str(item.get("card_id")): item
-            for item in pool if isinstance(item, dict)
-        } if isinstance(pool, list) else {}
-
-        def score(action):
-            card_id = action.action_id.split(":", 1)[-1]
-            card = card_by_id.get(card_id, {})
-            pokemon = card.get("species") or card.get("name") or action.label or ""
-            priority = _species_score(pokemon)
-            # Avoid hard-coding hidden abilities or moves: only use observed card fields.
-            moves = " ".join(map(str, card.get("moves", []))).lower()
-            if "tailwind" in moves or "fake out" in moves:
-                priority += 4
-            return priority
-
-        action = max(state.legal_actions, key=score)
-        return action, "Drafting a versatile, high-impact Pokémon."
-
-    def _lineup(self, template):
-        roster = template.get("roster") or []
-        if len(set(roster)) < 4:
-            raise ValueError("Too few distinct legal Pokémon in team preview")
-        bring = sorted(set(roster), key=_species_score, reverse=True)[:4]
-        speed = next((s for s in bring if _name(s) in {"tornadus", "whimsicott", "murkrow", "cresselia"}), None)
-        if speed:
-            leads = [speed, next(s for s in bring if s != speed)]
-        else:
-            leads = bring[:2]
-        return {"type": "select_lineup", "bring": bring, "leads": leads}, "Leading with complementary high-value Pokémon."
-
-    def _score_move(self, option, slot, target, last_target, reserved_setup=None):
-        kind = option.get("type")
-        if kind == "pass":
-            return -500
-        if kind == "switch":
-            return -35 + _species_score(option.get("species")) / 15
-        if kind != "move":
-            return -1000
-        move = _name(option.get("move_id"))
-        power = option.get("base_power", option.get("power", 0))
-        power = power if isinstance(power, (int, float)) else 0
-        base = 32 + min(85, max(0, power)) / 2.5
-        base += _MOVE_BONUS.get(move, 0)
-        if move in _AVOID:
-            base -= 110
-        if move == "fakeout":
-            base += 26 if self.turn == 0 else -43
-        if move in _SINGLE_USE_EARLY:
-            base += 30 if self.turn <= 1 and move not in self.used_setup else -90
-            if move == reserved_setup:
-                base -= 180
-        if move in {"protect", "detect"}:
-            base -= 22
-            if self.last_moves.get(slot) in {"protect", "detect"}:
-                base -= 38
-        if move in _SPREAD:
-            base += 13
-        if move in _SUPPORT_ALLY:
-            base += 15
-        if target is not None and target > 0:
-            base += _target_matchup_bonus(option, target)
-            base += 9
-            if last_target == target and move not in _SPREAD:
-                base += 11  # Coordinated fire improves knockout chances.
-        if target is not None and target < 0 and move not in _SUPPORT_ALLY:
-            base -= 140  # Never attack a teammate by accident.
-        # Moves without listed targets (field/spread) are allowed without a target.
-        return base
-
-    def _best_slot(self, options, slot, *, forced=False, reserved_switch=None, last_target=None, reserved_setup=None):
-        candidates = []
-        for option in options:
-            if not isinstance(option, dict):
-                continue
-            kind = option.get("type")
-            if forced and kind != "switch":
-                continue
-            if kind == "switch" and option.get("species") == reserved_switch:
-                continue
-            if kind == "move":
-                targets = option.get("targets") or []
-                targets = targets if isinstance(targets, list) else []
-                # Positive integers always target opponents under UCLA's doubles schema.
-                if _name(option.get("move_id")) in _SUPPORT_ALLY:
-                    eligible = [t for t in targets if type(t) is int and t < 0]
-                    eligible = eligible or targets
-                else:
-                    eligible = [t for t in targets if type(t) is int and t > 0]
-                    eligible = eligible or [t for t in targets if type(t) is int and t == 0]
-                if targets and not eligible:
-                    continue
-                for target in (eligible or [None]):
-                    payload = {"type": "move", "move_id": option["move_id"]}
-                    if target is not None:
-                        payload["target"] = target
-                    candidates.append((self._score_move(option, slot, target, last_target, reserved_setup), payload))
-            elif kind == "switch" and option.get("species"):
-                payload = {"type": "switch", "species": option["species"]}
-                score = 300 + _species_score(option["species"]) / 15 if forced else -15
-                candidates.append((score, payload))
-            elif kind == "pass":
-                candidates.append((-999, {"type": "pass"}))
-        if not candidates:
-            raise ValueError("No valid slot action found")
-        return max(candidates, key=lambda p: p[0])[1]
-
-    def _doubles(self, template):
-        slots = template.get("slots")
-        if not isinstance(slots, list) or len(slots) != 2:
-            raise ValueError("Unexpected doubles slot structure")
-        by_slot = {int(s.get("slot", i)): s for i, s in enumerate(slots) if isinstance(s, dict)}
-        if set(by_slot) != {0, 1}:
-            raise ValueError("Doubles slots 0 and 1 missing")
-        s0 = by_slot[0]
-        choice0 = self._best_slot(s0.get("options") or [], 0, forced=bool(s0.get("force_switch")))
-        reserved = choice0.get("species") if choice0["type"] == "switch" else None
-        last_target = choice0.get("target") if choice0["type"] == "move" else None
-        s1 = by_slot[1]
-        choice1 = self._best_slot(s1.get("options") or [], 1, forced=bool(s1.get("force_switch")),
-                                  reserved_switch=reserved, last_target=last_target,
-                                  reserved_setup=_name(choice0.get("move_id")))
-        if choice0["type"] == choice1["type"] == "pass":
-            # The server allows two passes only when both slots have no other choices.
-            raise ValueError("Unexpected double pass")
-        for index, choice in enumerate((choice0, choice1)):
-            if choice["type"] == "move":
-                move = _name(choice["move_id"])
-                self.last_moves[index] = move
-                if move in _SINGLE_USE_EARLY:
-                    self.used_setup.add(move)
-        self.turn += 1
-        return {"type": "doubles_turn", "slot_0": choice0, "slot_1": choice1}, "Prioritizing valid moves, tempo and coordinated knockouts."
-
-    def choose_action(self, state, context):
-        if not state.legal_actions:
-            return smoke_agent.choose_action(state, context)
-        try:
-            first = state.legal_actions[0]
-            if first.action_id == "select_lineup":
-                action, reason = self._lineup(self._template(first, "select_lineup"))
-            elif first.action_id == "doubles_turn":
-                action, reason = self._doubles(self._template(first, "doubles_turn"))
-            elif state.phase == "draft" or first.action_id.startswith("draft_pick:"):
-                action, reason = self._draft(state)
-            else:
-                action, reason = smoke_agent.choose_action(state, context), "Valid fallback action."
-        except (ValueError, KeyError, TypeError, IndexError) as exc:
-            # The official smoke agent fills in Pokémon templates with known-valid
-            # moves; much safer than guessing a payload when the server schema shifts.
-            self.log(f"[riffo] Pokémon policy fallback ({type(exc).__name__})")
-            action = smoke_agent.choose_action(state, context)
-            reason = "Server-validated fallback move."
-        self.log(f"[riffo] Pokémon: {reason}")
-        return WithReasoning(action, reason)
-
-
-class WerewolfCoach:
-    """Deterministic seven-seat Werewolf policy; never requires an API request.
-
-    The server supplies legal target IDs; all moves are selected from them.
-    Only the player's *private* observation can establish their role or
-    an investigation result. Public claims are merely weak evidence.
-    """
-
-    def __init__(self, *, log=print):
-        self.log = log
-        self.checked: set[int] = set()
-        self.seer_results: dict[int, str] = {}
-        self.messages: list[tuple[int | None, str]] = []
-        self.message_ids: set[int] = set()
-        self.last_spoken: int | None = None
-        self.wolf_mates: set[int] = set()
-        self.name_positions: dict[str, int] = {}
-
-    @staticmethod
-    def _text(obs) -> str:
-        if isinstance(obs, str):
-            return obs
-        if isinstance(obs, dict):
-            # The entire observation is private to the current player.
-            return json.dumps(obs, ensure_ascii=False, default=str)
-        return ""
-
-    @staticmethod
-    def _player_num(value) -> int | None:
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, int):
-            return value if 0 <= value <= 6 else None
-        if isinstance(value, str):
-            m = re.search(r"(?:player\s*)?([0-6])\b", value, flags=re.IGNORECASE)
-            return int(m.group(1)) if m else None
-        return None
-
-    def _seat(self, value) -> int | None:
-        number = self._player_num(value)
-        if number is not None:
-            return number
-        return self.name_positions.get(str(value or "").strip().casefold())
-
-    @staticmethod
-    def _role_from_obs(obs) -> str | None:
-        if isinstance(obs, dict):
-            for key in ("your_role", "my_role", "role"):
-                value = obs.get(key)
-                if isinstance(value, str) and value.lower().strip() in {"wolf", "werewolf", "seer", "villager"}:
-                    return "wolf" if "wolf" in value.lower() else value.lower().strip()
-        text = WerewolfCoach._text(obs)
-        m = re.search(r"\b(?:your role\s*(?:is|:)|you are (?:a |the )?)\s*(?:an?\s+)?(werewolf|wolf|seer|villager)\b", text, re.I)
-        if m:
-            role = m.group(1).lower()
-            return "wolf" if "wolf" in role else role
-        return None
-
-    def _learn_private(self, obs, role, me):
-        if role is None:
-            return
-        text = self._text(obs)
-        if role == "wolf":
-            # Only an explicitly private teammate statement establishes an ally.
-            if isinstance(obs, dict):
-                for key in ("wolf_teammate", "wolf_partner", "other_wolf", "teammate_position"):
-                    ally = self._seat(obs.get(key))
-                    if ally is not None and ally != me:
-                        self.wolf_mates.add(ally)
-            for pattern in (
-                r"(?:your|my)\s+(?:wolf\s+)?(?:teammate|partner|fellow\s+wolf)\s*(?:is|:)?\s*Player\s*([0-6])",
-                r"(?:the other wolf|your fellow wolf)\s*(?:is|:)?\s*Player\s*([0-6])",
-                r"(?:your|the)\s+wolves\s*(?:are|:)\s*Player\s*([0-6])\s*(?:and|,)\s*Player\s*([0-6])",
-            ):
-                for match in re.finditer(pattern, text, re.I):
-                    for num in match.groups():
-                        if num is not None and int(num) != me:
-                            self.wolf_mates.add(int(num))
-        if role != "seer":
-            return
-        if isinstance(obs, dict):
-            # Read only private observation fields, never public game_state.
-            for key in ("seer_results", "investigations", "investigation_results"):
-                data = obs.get(key)
-                if isinstance(data, dict):
-                    rows = [{"target": who, "role": result} for who, result in data.items()]
-                elif isinstance(data, list):
-                    rows = [x for x in data if isinstance(x, dict)]
-                else:
-                    rows = []
-                for row in rows:
-                    target = self._seat(row.get("target", row.get("player")))
-                    result = str(row.get("role", row.get("result", ""))).lower()
-                    if target is not None and result in {"wolf", "werewolf", "villager", "seer"}:
-                        self.seer_results[target] = "wolf" if "wolf" in result else "villager"
-                        self.checked.add(target)
-        # These phrases are facts in our own private seer observation. Never
-        # interpret public player messages as verified investigation results.
-        patterns = (
-            r"(?:you\s+)?investigat(?:ed|ion(?: result)?)\s*(?:of\s+)?Player\s*([0-6])[^.\n]{0,100}?\b(werewolf|wolf|villager|seer)\b",
-            r"(?:seer\s+result|your\s+result)\s*[:\-]?\s*Player\s*([0-6])[^.\n]{0,60}?\b(werewolf|wolf|villager|seer)\b",
-            r"Player\s*([0-6])\s*(?:was\s+)?(?:revealed|identified|confirmed|found)\s+(?:as\s+)?(?:a\s+)?(werewolf|wolf|villager|seer)\b",
-        )
-        for pattern in patterns:
-            for match in re.finditer(pattern, text, re.I):
-                target, result = int(match.group(1)), match.group(2).lower()
-                if target != me:
-                    self.seer_results[target] = "wolf" if "wolf" in result else "villager"
-                    self.checked.add(target)
-
-    def _remember_messages(self, state):
-        for msg in getattr(state, "new_messages", []) or []:
-            index = getattr(msg, "index", None)
-            if index is not None and index in self.message_ids:
-                continue
-            if index is not None:
-                self.message_ids.add(index)
-            content = str(getattr(msg, "content", "") or "")[:400]
-            sender = self._seat(getattr(msg, "sender", None))
-            if content:
-                self.messages.append((sender, content))
-        self.messages = self.messages[-70:]
-
-    def _confirmed_dead(self, game_state):
-        dead = {}
-        for row in game_state.get("dead", []) or []:
-            if isinstance(row, dict):
-                who = self._seat(row.get("position", row.get("name", row.get("player"))))
-                role = str(row.get("role", "")).lower()
-                if who is not None:
-                    dead[who] = role
-        return dead
-
-    def _public_suspicion(self, candidate, dead):
-        """Weak evidence from *targeted* claims, not unrelated names in a message.
-
-        A phrase like "Player0 is confirmed innocent. Vote Player1" must
-        NEVER mark Player0 suspicious merely because "vote" is elsewhere.
-        Role claims are unverified unless learned privately as the seer.
-        """
-        score = 0.0
-        mention = re.compile(rf"\bPlayer\s*{candidate}\b", re.I)
-        suspect_words = re.compile(r"\b(wolf|werewolf|suspicious|suspect|lying|liar|guilty|accuse|accusing|odd behavior|odd actions)\b", re.I)
-        innocence_words = re.compile(r"\b(innocent|cleared|confirmed (?:as )?(?:a )?villager|not (?:a )?wolf|trustworthy)\b", re.I)
-        vote_target = re.compile(rf"\b(?:vote|voting|lynch)\s+(?:for |on |against )?Player\s*{candidate}\b", re.I)
-        avoid_vote = re.compile(rf"\b(?:do not|don't|never|avoid)\s+vote\s+(?:for |on )?Player\s*{candidate}\b", re.I)
-        for sender, content in self.messages:
-            if sender == candidate:
-                # Do not count a player mentioning their own name as external evidence.
-                continue
-            weight = 0.15 if sender in dead and 'wolf' in dead[sender] else 1.0
-            for clause in re.split(r'[.!?;\n]+', content):
-                if not mention.search(clause):
-                    continue
-                if innocence_words.search(clause) or avoid_vote.search(clause):
-                    score -= 0.6 * weight
-                elif suspect_words.search(clause) or vote_target.search(clause):
-                    score += 1.2 * weight
-        return min(5.0, max(-3.0, score))
-
-    def _vote_history_suspicion(self, target, game_state, dead):
-        """Weakly weigh public votes against players later revealed dead.
-
-        Supported vote_history forms are individual rows or day records with
-        votes as a list or map. Unknown forms are ignored, never guessed.
-        """
-        history = game_state.get("vote_history") or []
-        if not isinstance(history, list):
-            return 0.0
-        votes = []
-        for entry in history[-10:]:
-            if not isinstance(entry, dict):
-                continue
-            bundle = entry.get("votes")
-            if isinstance(bundle, dict):
-                votes.extend((who, whom) for who, whom in bundle.items())
-            elif isinstance(bundle, list):
-                for row in bundle:
-                    if isinstance(row, dict):
-                        votes.append((row.get("voter", row.get("player")),
-                                      row.get("target", row.get("vote"))))
-            elif "voter" in entry or "player" in entry:
-                votes.append((entry.get("voter", entry.get("player")),
-                              entry.get("target", entry.get("vote"))))
-        score = 0.0
-        for who, whom in votes[-70:]:
-            if self._seat(who) != target:
-                continue
-            voted = self._seat(whom)
-            if voted is not None and voted in dead:
-                if "wolf" in dead[voted]:
-                    score -= 0.8
-                elif dead[voted] in {"villager", "seer"}:
-                    score += 0.35
-        return max(-3.0, min(3.0, score))
-
-    @staticmethod
-    def _tie_break(me, day, candidate):
-        # Stable and seat-dependent, so seven self-play seats don't all choose
-        # the same victim simply because the first legal action is Player0.
-        return ((candidate * 29 + (me or 0) * 17 + day * 13 + 7) % 37) / 100.0
-
-    def _context(self, state, context):
-        raw = state.raw if isinstance(state.raw, dict) else {}
-        gs = raw.get("game_state") if isinstance(raw.get("game_state"), dict) else {}
-        for p in raw.get("players", []) or []:
-            if isinstance(p, dict) and isinstance(p.get("position"), int) and isinstance(p.get("name"), str):
-                self.name_positions[p["name"].strip().casefold()] = p["position"]
-        me = self._seat(raw.get("your_position"))
-        if me is None:
-            me = self._seat(getattr(context, "seat_position", None))
-        obs = raw.get("observation", getattr(state, "observation", ""))
-        role = self._role_from_obs(obs)
-        day_value = gs.get("day", 1)
-        try:
-            day = max(1, int(day_value))
-        except (TypeError, ValueError):
-            day = 1
-        phase = str(gs.get("phase", ""))
-        self._learn_private(obs, role, me)
-        self._remember_messages(state)
-        return raw, gs, me, role, day, phase
-
-    def choose_action(self, state, context):
-        raw, gs, me, role, day, phase = self._context(state, context)
-        legal = []
-        for action in state.legal_actions:
-            seat = self._player_num(action.action_id)
-            if seat is not None:
-                legal.append((seat, action))
-        if not legal:
-            # Pass through a future, unexpected action schema, without guessing.
-            return state.legal_actions[0] if state.legal_actions else WAIT
-
-        dead = self._confirmed_dead(gs)
-        # Never intentionally vote for ourselves or a known wolf teammate.
-        # Keep server-provided legal actions intact if filtering leaves none.
-        safe = [(n, a) for n, a in legal if n != me and not (role == 'wolf' and n in self.wolf_mates)]
-        if safe:
-            legal = safe
-        non_abstain = [(n, action) for n, action in legal if n != 7]
-        if phase == "day_vote" and non_abstain:
-            legal = non_abstain  # The three-day no-elimination rule makes abstention risky.
-
-        def score(target):
-            value = self._tie_break(me, day, target)
-            if target in dead:
-                return -10000.0
-            if phase == "night_seer":
-                value += 5 if target not in self.checked else -100
-                # Check influential players rather than wasting repeat scans.
-                value += sum(sender == target for sender, _ in self.messages) * 0.45
-            elif phase == "night_wolf":
-                value += sum(sender == target for sender, _ in self.messages) * 0.9
-                if any(sender == target and re.search(r"\b(i am|i'm|im) (the |a )?seer\b|\bmy investigation\b", msg, re.I)
-                       for sender, msg in self.messages):
-                    value += 9
-            else:
-                if target in self.wolf_mates and role == "wolf":
-                    return -5000.0
-                if role == "seer" and self.seer_results.get(target) == "wolf":
-                    value += 1000.0
-                if role == "seer" and self.seer_results.get(target) == "villager":
-                    return -5000.0
-                # For villagers, public accusation is weak evidence. For
-                # wolves, eliminate vocal opponents instead of a known ally.
-                value += self._public_suspicion(target, dead)
-                value += self._vote_history_suspicion(target, gs, dead)
-                if role == "wolf":
-                    value += 0.25 * sum(sender == target for sender, _ in self.messages)
-            return value
-
-        target, decision = max(legal, key=lambda pair: score(pair[0]))
-        if phase == "night_seer":
-            self.checked.add(target)
-            reason = "Investigating a player I have not checked before."
-        elif phase == "night_wolf":
-            reason = "Choosing a night target based on available evidence."
-        else:
-            reason = "Voting based on the current evidence and revealed roles."
-        self.log(f"[riffo] Werewolf: {phase or 'move'} => Player{target}")
-        return WithReasoning(decision, reason)
-
-    def choose_message(self, state, context):
-        raw, gs, me, role, day, phase = self._context(state, context)
-        if day == self.last_spoken:
-            return TERMINATE_MESSAGING
-        self.last_spoken = day
-        dead = self._confirmed_dead(gs)
-        alive = {self._seat(v) for v in (gs.get("alive") or [])}
-        alive.discard(None)
-        if role == "seer":
-            wolves = sorted(t for t, result in self.seer_results.items()
-                           if result == "wolf" and t not in dead and t in alive)
-            if wolves:
-                target = wolves[0]
-                self.log(f"[riffo] Werewolf: reporting confirmed investigation to discussion")
-                return SendMessage(f"I am the seer. I investigated Player{target} and learned they are a wolf. Vote Player{target}.")
-        if role == "wolf" and self.wolf_mates:
-            living_mates = sorted(t for t in self.wolf_mates if t not in dead and t in alive)
-            targets = sorted(t for t in alive if t != me and t not in self.wolf_mates)
-            if living_mates and targets:
-                target = max(targets, key=lambda t: self._public_suspicion(t, dead))
-                self.log("[riffo] Werewolf: private teammate coordination")
-                return SendMessage(f"Let's coordinate today's votes on Player{target} if possible.", [living_mates[0]])
-        # Unlike a fabricated 'Player X is a wolf' claim, this helps coordinate
-        # actual evidence without leaking private information or spamming chat.
-        if day == 1 and role != "wolf":
-            self.log("[riffo] Werewolf: requesting evidence")
-            return SendMessage("Please share evidence and voting reasons. We need a coordinated vote, not random accusations.")
-        return TERMINATE_MESSAGING
-
-
-
-# ---------------------------------------------------------------------------
-# Riffo v5: AI-assisted decision optimization across all three live games.
-# We maximize estimated utility, rather than minimizing API calls at the
-# expense of reasoning.  The utilities are comparative heuristics, NOT
-# calibrated win probabilities or a learned value function.
-# ---------------------------------------------------------------------------
-
-import itertools
-import math
-import os
-from examples.llm.base import object_schema, InvalidChoice
-from examples.llm.pokemon import doubles_choice, lineup_choice
+from examples.llm_agent import LLMAgent, _discrete_choice
+from examples.llm.providers import ProviderError, provider_from_env
+from examples.llm.base import InvalidChoice, object_schema
 from examples.llm.redalert import validate_orders, order_fields, _limits
 
 
-class ResilientProvider:
-    """OpenAI-compatible strict-JSON provider with rate-limit backoff.
-
-    One request per strategic decision. No automatic retry storms. Each
-    subprocess/seat has its own budget; this is not a cross-process limiter.
-    """
-
-    def __init__(self, provider, *, clock=time.monotonic):
-        self._provider = provider
-        self.model = provider.model
-        self.clock = clock
-        self.blocked_until = 0.0
-
-    def complete_structured(self, messages, schema_name, schema, *, timeout=None):
-        if self.clock() < self.blocked_until:
-            raise ProviderError('API cooling down; local policy takes over')
-        try:
-            return self._provider.complete_structured(
-                messages, schema_name, schema, timeout=timeout)
-        except ProviderError as exc:
-            # Never copy raw HTTP response bodies, tokens, or credentials to logs.
-            message = str(exc)
-            if '429' in message:
-                self.blocked_until = self.clock() + 45
-            elif '413' in message:
-                self.blocked_until = self.clock() + 90
-            raise
+def _dict(v: Any) -> dict:
+    return v if isinstance(v, dict) else {}
 
 
-def _compact(obj: Any, limit: int = 2200) -> str:
-    """Truncate observations and history so a whole state isn't re-sent."""
-    if isinstance(obj, str):
-        return obj[:limit]
-    try:
-        return json.dumps(obj, ensure_ascii=False, separators=(',', ':'), default=str)[:limit]
-    except (TypeError, ValueError):
-        return ''
+def _rows(v: Any) -> list[dict]:
+    return [r for r in v if isinstance(r, dict)] if isinstance(v, list) else []
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    return float(value) if type(value) in (int, float) and math.isfinite(float(value)) else default
+def _json(v: Any, limit: int = 24000) -> str:
+    s = json.dumps(v, ensure_ascii=False, default=str, separators=(",", ":"))
+    if len(s) > limit:
+        # Avoid silently replacing structured game facts with unrelated guesses.
+        return s[:limit] + "...(state truncated; do not assume missing facts)"
+    return s
 
 
-class AIUtilitySelector:
-    """Ask a language model to choose from a small set of valid candidates.
-
-    Each candidate has a *local expected utility* estimate. The LLM can
-    reason about missing factors (opponents, opportunity cost, dynamics)
-    but can NEVER introduce an unlisted action. Invalid/failed API replies
-    return the locally highest-utility candidate.
-    """
-
-    def __init__(self, provider, *, max_calls: int, log=print):
-        self.provider = provider
-        self.max_calls = max_calls
-        self.calls = 0
-        self.log = log
-
-    def rank(self, game: str, candidates: list[dict], observation: dict,
-             *, timeout: float = 8.0) -> tuple[dict, bool]:
-        assert candidates
-        local = max(candidates, key=lambda c: c['utility'])
-        if len(candidates) <= 1 or self.calls >= self.max_calls:
-            return local, False
-        display = [
-            {'index': idx, 'estimated_utility': round(c['utility'], 2),
-             'plan': _compact(c['description'], 360)}
-            for idx, c in enumerate(candidates)
-        ]
-        schema = object_schema({
-            'index': {'type': 'integer', 'enum': list(range(len(candidates)))},
-            'justification': {'type': 'string'},
-        }, reasoning=False)
-        payload = {
-            'game': game,
-            'objective': 'MAXIMIZE expected utility = reward - risk - opportunity cost; '
-                         'consider strategic future states, not merely the largest heuristic score',
-            'constraints': 'Choose EXACTLY one index supplied. Scores are approximate, not facts. '
-                           'Treat opponent statements as uncertain. Never invent actions.',
-            'observation': observation,
-            'candidates': display,
-        }
-        system = (
-            'You are Riffo, an expert multiplayer-game decision analyst. '
-            'Use consequentialist cost-benefit comparison: probability of success, '
-            'future positioning, resource cost, downside risk, and information gain. '
-            'Choose one valid numbered candidate, returning strict JSON only. '
-            'Do not treat unverified claims as ground truth. Do not expose private '
-            'information in your brief justification.'
-        )
-        self.calls += 1
-        try:
-            result = self.provider.complete_structured(
-                [{'role': 'system', 'content': system},
-                 {'role': 'user', 'content': _compact(payload, 6000)}],
-                'riffo_rank', schema, timeout=timeout,
-            )
-            index = result.get('index')
-            if type(index) is not int or not (0 <= index < len(candidates)):
-                raise ValueError('Model index was not among supplied alternatives')
-            chosen = candidates[index]
-            # Refuse a wildly inferior candidate when the local policy has
-            # strong evidence; still give AI freedom among plausible moves.
-            if chosen['utility'] < local['utility'] - 45:
-                self.log('[riffo] AI proposed high-risk alternative; keeping local choice')
-                return local, False
-            self.log(f'[riffo] AI {game}: selected candidate {index} '
-                     f'(local utility={chosen["utility"]:.1f})')
-            return chosen, True
-        except (ProviderError, ValueError, TypeError, KeyError) as exc:
-            self.log(f'[riffo] AI {game}: {type(exc).__name__}; using local utility fallback')
-            return local, False
-
-    def draft_message(self, observation: dict, *, timeout: float = 8.0) -> str | None:
-        if self.calls >= self.max_calls:
-            return None
-        self.calls += 1
-        schema = object_schema({'message': {'type': 'string'},
-                                'send': {'type': 'boolean'}}, reasoning=False)
-        try:
-            answer = self.provider.complete_structured(
-                [
-                    {'role': 'system', 'content': (
-                        'You play seven-seat Werewolf. Write a short strategic in-game '
-                        'message: solicit information, cite evidence, and coordinate '
-                        'votes. Be skeptical of other players claims. Never pretend '
-                        'an unverified rumor is a confirmed seer investigation. '
-                        'Limit the message to 35 words. Output strict JSON.'
-                    )},
-                    {'role': 'user', 'content': _compact(observation, 4300)},
-                ],
-                'riffo_chat', schema, timeout=timeout,
-            )
-            if answer.get('send') is not True:
-                return None
-            message = answer.get('message')
-            if not isinstance(message, str):
-                return None
-            return ' '.join(message.split()[:35])[:260] or None
-        except (ProviderError, ValueError, KeyError, TypeError):
-            return None
+def _seat(v: Any) -> int | None:
+    if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 6:
+        return v
+    if isinstance(v, str):
+        match = re.fullmatch(r"\s*(?:Player\s*)?([0-6])\s*", v, flags=re.I)
+        if match:
+            return int(match.group(1))
+    if isinstance(v, dict):
+        for field in ("position", "seat", "player", "id"):
+            s = _seat(v.get(field))
+            if s is not None:
+                return s
+    return None
 
 
-class HybridPokemon:
-    """Choose among validated draft/lineup/turn actions using local costs and AI."""
-
-    def __init__(self, provider, *, log=print):
-        self.local = PokemonCoach(log=lambda *_: None)
-        self.selector = AIUtilitySelector(provider, max_calls=int(os.getenv('RIFFO_POKEMON_AI_CALLS', '18')), log=log)
-        self.log = log
-
-    def _alternatives(self, state) -> list[dict]:
-        if not state.legal_actions:
-            return []
-        first = state.legal_actions[0]
-        if first.action_id.startswith('draft_pick:'):
-            obs = state.raw.get('observation') if isinstance(state.raw, dict) else {}
-            cards = obs.get('available_cards', []) if isinstance(obs, dict) else []
-            pool = {str(row.get('card_id')): row for row in cards if isinstance(row, dict)}
-            candidates = []
-            for action in state.legal_actions:
-                card = pool.get(action.action_id.partition(':')[2], {})
-                species = card.get('species') or action.label or action.action_id
-                score = _species_score(species)
-                moves = _compact(card.get('moves', []), 250).lower()
-                score += 4 if 'tailwind' in moves or 'fake out' in moves else 0
-                candidates.append({'action': action, 'utility': score,
-                                   'description': f'Draft {species}; card={_compact(card, 350)}'})
-            return sorted(candidates, key=lambda x: -x['utility'])[:7]
-
-        if first.action_id == 'select_lineup':
-            template = first.input.get('action', {})
-            roster = list(dict.fromkeys(template.get('roster') or []))
-            if len(roster) < 4:
-                return []
-            validator = lineup_choice(first, state)
-            cands = []
-            for bring in itertools.combinations(roster, 4):
-                base = sum(_species_score(species) for species in bring)
-                for lead in itertools.combinations(bring, 2):
-                    speed = any(_name(x) in {'tornadus','whimsicott','murkrow','cresselia'} for x in lead)
-                    score = base + (9 if speed else 0)
-                    payload = {'bring': list(bring), 'leads': list(lead)}
-                    try:
-                        action = validator.build(payload)
-                    except InvalidChoice:
-                        continue
-                    cands.append({'action': action, 'utility': score,
-                                  'description': f'Bring {bring}; lead {lead}'})
-            return sorted(cands, key=lambda x: -x['utility'])[:7]
-
-        if first.action_id == 'doubles_turn':
-            template = first.input.get('action', {})
-            slots = sorted(template.get('slots') or [], key=lambda x: x.get('slot', 0))
-            if len(slots) != 2:
-                return []
-            validator = doubles_choice(first, state)
-            slot_options = []
-            for number, slot in enumerate(slots):
-                options = []
-                for idx, option in enumerate(slot.get('options') or []):
-                    kind = option.get('type')
-                    if bool(slot.get('force_switch')) and kind != 'switch':
-                        continue
-                    targets = option.get('targets') or []
-                    if kind == 'move':
-                        move = _name(option.get('move_id'))
-                        targets = ([t for t in targets if type(t) is int and (
-                            t >= 0 or move in _SUPPORT_ALLY)] if targets else [None])
-                        if not targets:
-                            continue
-                        for target in targets:
-                            score = self.local._score_move(option, number, target, None)
-                            options.append(({'option': idx, 'target': target}, score,
-                                            f'{option.get("move_id")} at {target}'))
-                    elif kind == 'switch':
-                        score = _species_score(option.get('species')) / 12 - 10
-                        if slot.get('force_switch'):
-                            score += 250
-                        options.append(({'option': idx, 'target': None}, score,
-                                        f'switch to {option.get("species")}'))
-                    elif kind == 'pass':
-                        options.append(({'option': idx, 'target': None}, -250, 'pass'))
-                slot_options.append(sorted(options, key=lambda x: -x[1])[:5])
-            candidates = []
-            for a, b in itertools.product(*slot_options):
-                try:
-                    action = validator.build({'slot_0': a[0], 'slot_1': b[0]})
-                except InvalidChoice:
-                    continue
-                coordinated = (action['slot_0'].get('target') == action['slot_1'].get('target')
-                               and type(action['slot_0'].get('target')) is int
-                               and action['slot_0']['target'] > 0
-                               and action['slot_0']['type'] == action['slot_1']['type'] == 'move')
-                score = a[1] + b[1] + (12 if coordinated else 0)
-                candidates.append({'action': action, 'utility': score,
-                                   'description': f'slot0: {a[2]}; slot1: {b[2]}'})
-            return sorted(candidates, key=lambda x: -x['utility'])[:8]
-        return []
-
-    def choose_action(self, state, context):
-        before_setup = set(self.local.used_setup)
-        before_last = dict(self.local.last_moves)
-        # Score BEFORE the local fallback updates its move history; otherwise
-        # Tailwind and Fake Out would be penalized on their first real use.
-        try:
-            candidates = self._alternatives(state)
-        except (ValueError, KeyError, TypeError, IndexError) as exc:
-            self.log(f'[riffo] Pokemon candidate generation fallback ({type(exc).__name__})')
-            candidates = []
-        fallback = self.local.choose_action(state, context)
-        if not candidates:
-            return fallback
-        phase = state.phase
-        # Draft/preview always warrant model consultation. During battle,
-        # consult on every second turn; the local evaluator handles the rest.
-        use_ai = phase == 'draft' or state.legal_actions[0].action_id == 'select_lineup' or self.local.turn % 2 == 1
-        if use_ai:
-            raw = state.raw if isinstance(state.raw, dict) else {}
-            observation = {
-                'phase': phase,
-                'brief_state': _compact(raw.get('observation'), 1600),
-                'our_last_moves': before_last,
-                'setup_used': sorted(before_setup),
-            }
-            choice, _ = self.selector.rank('pokemon', candidates, observation,
-                                           timeout=5.5 if phase == 'draft' else 9)
-        else:
-            choice = max(candidates, key=lambda x: x['utility'])
-        picked = choice['action']
-        if isinstance(picked, dict) and picked.get('type') == 'doubles_turn':
-            self.local.used_setup = before_setup
-            self.local.last_moves = before_last
-            for i in (0, 1):
-                move = picked[f'slot_{i}']
-                if move.get('type') == 'move':
-                    name = _name(move.get('move_id'))
-                    self.local.last_moves[i] = name
-                    if name in _SINGLE_USE_EARLY:
-                        self.local.used_setup.add(name)
-        reason = 'Utility-ranked, legal Pokémon decision.'
-        self.log(f'[riffo] Pokemon: {reason} Model calls={self.selector.calls}')
-        return WithReasoning(picked, reason)
+def _role(observation: Any) -> str | None:
+    if isinstance(observation, dict):
+        for key in ("your_role", "my_role", "role"):
+            value = observation.get(key)
+            if isinstance(value, str) and value.strip().lower() in ("wolf", "werewolf", "seer", "villager"):
+                return "wolf" if "wolf" in value.lower() else value.lower()
+    if isinstance(observation, str):
+        match = re.search(r"\b(?:your role\s*(?:is|:)|you are (?:a |the )?)\s*(werewolf|wolf|seer|villager)\b", observation, re.I)
+        if match:
+            return "wolf" if "wolf" in match[1].lower() else match[1].lower()
+    return None
 
 
-class HybridWerewolf:
-    """Local role/evidence inference plus AI interpretation and cost-sensitive votes."""
-
-    def __init__(self, provider, *, log=print):
-        self.local = WerewolfCoach(log=lambda *_: None)
-        self.selector = AIUtilitySelector(provider, max_calls=int(os.getenv('RIFFO_WEREWOLF_AI_CALLS', '16')), log=log)
-        self.log = log
-
-    def _state_brief(self, state, context) -> tuple[dict, dict, int | None, str | None, int, str]:
-        return self.local._context(state, context)
-
-    def choose_action(self, state, context):
-        previously_checked = set(self.local.checked)
-        fallback = self.local.choose_action(state, context)
-        raw, gs, me, role, day, phase = self._state_brief(state, context)
-        if not isinstance(fallback, WithReasoning):
-            return fallback
-        dead = self.local._confirmed_dead(gs)
-        options = []
-        for action in state.legal_actions:
-            t = self.local._player_num(action.action_id)
-            if t is None or t in dead or t == me:
-                continue
-            if t == 7:
-                # Abstaining is legal, but risky because three days with no
-                # elimination make wolves win. Only allow if nothing else.
-                continue
-            if role == 'wolf' and t in self.local.wolf_mates:
-                continue
-            if role == 'seer' and phase == 'day_vote' and self.local.seer_results.get(t) == 'villager':
-                continue
-            suspicion = self.local._public_suspicion(t, dead)
-            voting = self.local._vote_history_suspicion(t, gs, dead)
-            voice = sum(sender == t for sender, _ in self.local.messages)
-            if phase == 'night_seer':
-                # Information gain: high for uninvestigated, influential players.
-                cost = 25 if t in previously_checked else 0
-                utility = 13 + min(voice, 6) - cost
-            elif phase == 'night_wolf':
-                seer_claim = any(sender == t and re.search(
-                    r'\b(i am|i.m|im) (the |a )?seer\b|\bmy investigation\b', msg, re.I)
-                    for sender, msg in self.local.messages)
-                utility = 15 + 13 * int(seer_claim) + 1.3 * voice
-            elif role == 'wolf':
-                utility = 8 + 1.2 * suspicion + 0.4 * voice
-            else:
-                if role == 'seer' and self.local.seer_results.get(t) == 'wolf':
-                    utility = 100
-                else:
-                    # Proxy for expected benefit: P(wolf)*value of elimination
-                    # minus P(villager)*opportunity cost and coalition risk.
-                    prob_wolf = max(0.06, min(0.9, 0.28 + 0.085 * (suspicion + voting)))
-                    utility = 15 * prob_wolf - 9 * (1 - prob_wolf)
-                    utility += 0.25 * min(voice, 5)
-            options.append({'action': action, 'utility': utility,
-                            'description': f'Player{t}: suspicion={suspicion:.1f}, public votes={voting:.1f}, messages={voice}'})
-        if not options:
-            return fallback
-        # A seer who has confirmed a living wolf never lets LLM override
-        # that fact with an unverified accusation.
-        if role == 'seer' and phase == 'day_vote':
-            certain = [c for c in options if self.local.seer_results.get(int(c['action'].action_id)) == 'wolf']
-            if certain:
-                options = certain
-        options.sort(key=lambda c: -c['utility'])
-        options = options[:6]
-        observation = {
-            'role_private_to_you': role,
-            'your_seat': me,
-            'day': day,
-            'phase': phase,
-            'private_observation': _compact(raw.get('observation'), 1100),
-            'dead_and_votes': _compact({'dead': gs.get('dead'), 'vote_history': gs.get('vote_history')}, 1400),
-            'recent_public_messages': [(f'Player{who}', text[:180]) for who, text in self.local.messages[-10:]],
-            'confirmed_seer_results_private': self.local.seer_results if role == 'seer' else {},
-            'known_wolf_teammates_private': sorted(self.local.wolf_mates) if role == 'wolf' else [],
-        }
-        selected, _ = self.selector.rank('werewolf', options, observation, timeout=7)
-        chosen = selected['action']
-        if phase == 'night_seer':
-            baseline_target = self.local._player_num(fallback.action.action_id)
-            if baseline_target not in previously_checked:
-                self.local.checked.discard(baseline_target)
-            self.local.checked.add(int(chosen.action_id))
-        summary = 'Weighed role evidence, vote likelihood and strategic downside.'
-        self.log(f'[riffo] Werewolf {phase}: Player{chosen.action_id}')
-        return WithReasoning(chosen, summary)
-
-    def choose_message(self, state, context):
-        """Use AI to select *fact-safe* discussion messages.
-
-        Unrestricted LLM prose previously invented witnessed actions, accused
-        the seer of being a wolf, and asked people to vote for the speaker.
-        Candidate selection still uses GPT-4o-mini; candidate wording is
-        validated locally, so fabricated clues cannot enter the public record.
-        """
-        baseline = self.local.choose_message(state, context)
-        raw, gs, me, role, day, phase = self._state_brief(state, context)
-        # Only private confirmed Seer results justify hard claims. Wolf chat
-        # stays private to the intended teammate.
-        if role == 'seer' and isinstance(baseline, SendMessage):
-            return baseline
-        if role == 'wolf' and isinstance(baseline, SendMessage):
-            return baseline
-        if self.local.last_spoken != day:
-            return TERMINATE_MESSAGING
-        if not hasattr(self, '_ai_spoken_days'):
-            self._ai_spoken_days = set()
-        if day in self._ai_spoken_days:
-            return TERMINATE_MESSAGING
-        self._ai_spoken_days.add(day)
-
-        dead = self.local._confirmed_dead(gs)
-        alive = {self.local._seat(v) for v in (gs.get('alive') or [])}
-        alive.discard(None)
-        eligible = sorted(t for t in alive if t != me and t not in dead and
-                          (role != 'wolf' or t not in self.local.wolf_mates) and
-                          (role != 'seer' or self.local.seer_results.get(t) != 'villager'))
-        options = [
-            {'action': 'Let us compare actual public votes and statements. Which specific contradiction supports a wolf accusation?',
-             'utility': 11.0, 'description': 'Ask for verifiable public contradictions instead of invented evidence.'},
-            {'action': 'We should coordinate one evidence-based vote instead of splitting votes. Which player has the strongest public case against them?',
-             'utility': 10.5, 'description': 'Organize coalition voting without accusing a particular player.'},
-            {'action': 'Please separate confirmed Seer results from guesses. Can anyone cite a concrete public vote or contradictory statement?',
-             'utility': 10.0, 'description': 'Discourage fabricated role claims and request checkable facts.'},
-        ]
-        if eligible:
-            # A question is safe, but a claim that we watched a private action
-            # is not. Also never request a vote for our own seat.
-            target = max(eligible, key=lambda t: (self.local._public_suspicion(t, dead),
-                                                  sum(sender == t for sender, _ in self.local.messages)))
-            options.append({
-                'action': f'Player{target}, can you explain your public voting reasoning? I want to compare evidence before choosing a target.',
-                'utility': 9.8 + self.local._public_suspicion(target, dead) * 0.4,
-                'description': f'Ask Player{target} to explain their public voting behavior. No factual accusation.'
-            })
-        if role == 'seer' and self.local.seer_results:
-            options.append({
-                'action': 'Please do not treat unsupported role claims as proof. We should avoid eliminating players without evidence.',
-                'utility': 10.8, 'description': 'Protect verified information without leaking private checks.'
-            })
-        brief = {
-            'day': day, 'your_role_private': role, 'your_seat': me,
-            'confirmed_seer_results_private': self.local.seer_results if role == 'seer' else {},
-            'public_vote_history': _compact(gs.get('vote_history'), 900),
-            'public_recent_messages': [(f'Player{who}' if who is not None else 'unknown', text[:160])
-                                       for who, text in self.local.messages[-10:]],
-            'purpose': 'Choose the best strategically useful and truthful DISCUSSION QUESTION. '
-                       'Candidates never assert unverified game facts or ask anyone to vote for you.'
-        }
-        picked, used_ai = self.selector.rank('werewolf_discussion', options, brief, timeout=7)
-        if used_ai:
-            self.log(f'[riffo] Werewolf: AI-selected safe discussion on day {day}')
-        return SendMessage(picked['action'])
-
-
-class HybridRedAlert(FastRedAlert):
-    """Immediate safe micro + infrequent AI military/economic plan comparison."""
-
-    MAX_LLM_CALLS = 10
-    LLM_INTERVAL = 75.0
-
-    @staticmethod
-    def _order_utility(order: dict, raw: dict) -> float:
-        """Rough net benefit: progress + force + economy - risk - spending."""
-        if not isinstance(order, dict):
-            return -1e6
-        obs = raw.get('observation') if isinstance(raw.get('observation'), dict) else {}
-        buildings = [str(b.get('type')).lower() for b in obs.get('buildings', []) if isinstance(b, dict)]
-        units = [u for u in obs.get('units', []) if isinstance(u, dict)]
-        econ = obs.get('economy') if isinstance(obs.get('economy'), dict) else {}
-        power_short = _safe_float(econ.get('power_drained')) > _safe_float(econ.get('power_provided'))
-        cash = _safe_float(econ.get('cash'), 2500)
-        cmd, item = order.get('cmd'), str(order.get('item') or '').lower()
-        if cmd == 'deploy':
-            return 1000
-        if cmd == 'place':
-            return 850
-        if cmd == 'build':
-            base = {'powr': 105, 'tent': 90, 'barr': 90, 'proc': 118,
-                    'weap': 112, 'afld': 105}.get(item, 30)
-            if item == 'powr' and power_short:
-                base += 90
-            # A larger cash buffer gives more opportunity to invest.
-            base += min(20, max(-25, (cash - 1500) / 160))
-            if item in buildings:
-                base -= 80
-            return base
-        if cmd == 'train':
-            combat = sum(str(u.get('type')).lower() not in {'mcv','harv','harvester'} for u in units)
-            return 80 + (30 if combat < 4 else -8) - 0.04 * max(0, 1800 - cash)
-        if cmd in {'attack_move', 'attack'}:
-            army_size = len(order.get('units') or [])
-            return 45 + min(85, army_size * 11) - (40 if army_size < 3 else 0)
-        if cmd == 'repair':
-            return 45
-        return 5
-
-    def choose_action(self, state, context):
-        raw = state.raw
-        if not isinstance(raw.get('observation'), dict):
-            return WAIT
-        candidate = self._heuristic(raw)
-        if candidate and candidate[0].get('cmd') in {'deploy','place'}:
-            return super().choose_action(state, context)
-        now = self._clock()
-        should_ask = (now - self._last_llm >= self.LLM_INTERVAL
-                      and self._llm.calls < self.MAX_LLM_CALLS)
-        if should_ask:
-            self._last_llm = now
-            try:
-                model_action = self._llm.choose_action(state, context)
-                if isinstance(model_action, WithReasoning):
-                    payload = model_action.action
-                    orders = payload.get('orders') if isinstance(payload, dict) else None
-                    if isinstance(orders, list):
-                        valid, dropped = validate_orders(orders, order_fields(context.game_config), _limits(raw))
-                        if valid and not dropped:
-                            model_score = sum(self._order_utility(order, raw) for order in valid)
-                            local_score = self._order_utility(candidate[0], raw) if candidate else 0
-                            # Prefer a viable AI multi-order plan when it adds value;
-                            # otherwise keep a near-instant deterministic response.
-                            if model_score >= local_score - 10:
-                                self._last_was_llm = True
-                                self.log_ai(model_score, local_score)
-                                return model_action
-            except (ProviderError, ValueError, TypeError, KeyError) as exc:
-                self._log(f'[riffo] Red Alert: planning fallback ({type(exc).__name__})')
-            # In case of WAIT or inferior AI choice, use the local order.
-            self._last_was_llm = False
-        return super().choose_action(state, context)
-
-    def log_ai(self, score, local):
-        self._log(f'[riffo] Red Alert: accepted AI plan (utility {score:.1f} vs {local:.1f})')
-
-
-# ---------------------------------------------------------------------------
-# Riffo v5.1 — matchup-aware scoring. Uses only authoritative offered moves.
-# ---------------------------------------------------------------------------
-
-# Gen 9 type chart: attacker -> defender -> multiplier (unspecified = 1).
+# This is a complete Gen-9 attacking-type chart, NOT a ranking of species or
+# an attempt to simulate Showdown battles. It is used only to fact-check
+# model-facing matchups, never to remove legal choices.
 _TYPE_CHART = {
-  'normal': {'rock':.5,'steel':.5,'ghost':0},
-  'fire': {'grass':2,'ice':2,'bug':2,'steel':2,'fire':.5,'water':.5,'rock':.5,'dragon':.5},
-  'water': {'fire':2,'ground':2,'rock':2,'water':.5,'grass':.5,'dragon':.5},
-  'electric': {'water':2,'flying':2,'electric':.5,'grass':.5,'dragon':.5,'ground':0},
-  'grass': {'water':2,'ground':2,'rock':2,'fire':.5,'grass':.5,'poison':.5,'flying':.5,'bug':.5,'dragon':.5,'steel':.5},
-  'ice': {'grass':2,'ground':2,'flying':2,'dragon':2,'fire':.5,'water':.5,'ice':.5,'steel':.5},
-  'fighting': {'normal':2,'ice':2,'rock':2,'dark':2,'steel':2,'poison':.5,'flying':.5,'psychic':.5,'bug':.5,'fairy':.5,'ghost':0},
-  'poison': {'grass':2,'fairy':2,'poison':.5,'ground':.5,'rock':.5,'ghost':.5,'steel':0},
-  'ground': {'fire':2,'electric':2,'poison':2,'rock':2,'steel':2,'grass':.5,'bug':.5,'flying':0},
-  'flying': {'grass':2,'fighting':2,'bug':2,'electric':.5,'rock':.5,'steel':.5},
-  'psychic': {'fighting':2,'poison':2,'psychic':.5,'steel':.5,'dark':0},
-  'bug': {'grass':2,'psychic':2,'dark':2,'fire':.5,'fighting':.5,'poison':.5,'flying':.5,'ghost':.5,'steel':.5,'fairy':.5},
-  'rock': {'fire':2,'ice':2,'flying':2,'bug':2,'fighting':.5,'ground':.5,'steel':.5},
-  'ghost': {'psychic':2,'ghost':2,'dark':.5,'normal':0},
-  'dragon': {'dragon':2,'steel':.5,'fairy':0},
-  'dark': {'psychic':2,'ghost':2,'fighting':.5,'dark':.5,'fairy':.5},
-  'steel': {'ice':2,'rock':2,'fairy':2,'fire':.5,'water':.5,'electric':.5,'steel':.5},
-  'fairy': {'fighting':2,'dragon':2,'dark':2,'fire':.5,'poison':.5,'steel':.5},
-}
-_MOVE_POWER_ESTIMATE = {
-  'astralbarrage':120,'glaciallance':120,'surgingstrikes':75,'wickedblow':75,
-  'makeitrain':120,'bleakwindstorm':100,'moonblast':95,'dazzlinggleam':80,
-  'heatwave':95,'rockslide':75,'earthpower':90,'closecombat':120,
-  'flareblitz':120,'woodhammer':120,'wildcharge':90,'playrough':90,
-  'thunderbolt':90,'icebeam':90,'shadowball':80,'energyball':90,
-  'knockoff':65,'grassyglide':55,'tackle':40,'fakeout':40,
-  'hydropump':110,'dracometeor':130,'hypervoice':90,'sludgebomb':90,
-  'earthquake':100,'stompingtantrum':75,'highhorsepower':95,
-  'iciclecrash':85,'ironhead':80,'darkpulse':80,'airslash':75,
-  'bravebird':120,'hurricane':110,'leafstorm':130,
-  'protect':0,'detect':0,'tailwind':0,'trickroom':0,
-  'spore':0,'sleeppowder':0,'followme':0,'ragepowder':0,
-  'helpinghand':0,'partingshot':0,'wideguard':0,
-}
-_MORE_SPECIES_TYPES = {
-  'arcanine':('fire',), 'porygon2':('normal',), 'cresselia':('psychic',),
-  'dialga':('steel','dragon'),'terapagos':('normal',),'regieleki':('electric',),
-  'regidrago':('dragon',),'chienpao':('dark','ice'), 'murkrow':('dark','flying'),
-  'kingambit':('dark','steel'),'ursaring':('normal',), 'ogerponhearthflame':('grass','fire'),
-  'ogerponcornerstone':('grass','rock'), 'ogerponthearthflame':('grass','fire'),
-  'gholdengo':('steel','ghost'), 'ursalunabloodmoon':('ground','normal'),
-  'archaludon':('steel','dragon'),'indeedee':('psychic','normal'),
-  'lando':('ground','flying'),'ironbundle':('ice','water'),
-  'roaringmoon':('dragon','dark'),'walkingwake':('water','dragon'),
-  'chi-yu':('dark','fire'),'chiyu':('dark','fire'),
+    "normal": (set(), {"rock", "steel"}, {"ghost"}),
+    "fire": ({"grass", "ice", "bug", "steel"}, {"fire", "water", "rock", "dragon"}, set()),
+    "water": ({"fire", "ground", "rock"}, {"water", "grass", "dragon"}, set()),
+    "electric": ({"water", "flying"}, {"electric", "grass", "dragon"}, {"ground"}),
+    "grass": ({"water", "ground", "rock"}, {"fire", "grass", "poison", "flying", "bug", "dragon", "steel"}, set()),
+    "ice": ({"grass", "ground", "flying", "dragon"}, {"fire", "water", "ice", "steel"}, set()),
+    "fighting": ({"normal", "ice", "rock", "dark", "steel"}, {"poison", "flying", "psychic", "bug", "fairy"}, {"ghost"}),
+    "poison": ({"grass", "fairy"}, {"poison", "ground", "rock", "ghost"}, {"steel"}),
+    "ground": ({"fire", "electric", "poison", "rock", "steel"}, {"grass", "bug"}, {"flying"}),
+    "flying": ({"grass", "fighting", "bug"}, {"electric", "rock", "steel"}, set()),
+    "psychic": ({"fighting", "poison"}, {"psychic", "steel"}, {"dark"}),
+    "bug": ({"grass", "psychic", "dark"}, {"fire", "fighting", "poison", "flying", "ghost", "steel", "fairy"}, set()),
+    "rock": ({"fire", "ice", "flying", "bug"}, {"fighting", "ground", "steel"}, set()),
+    "ghost": ({"psychic", "ghost"}, {"dark"}, {"normal"}),
+    "dragon": ({"dragon"}, {"steel"}, {"fairy"}),
+    "dark": ({"psychic", "ghost"}, {"fighting", "dark", "fairy"}, set()),
+    "steel": ({"ice", "rock", "fairy"}, {"fire", "water", "electric", "steel"}, set()),
+    "fairy": ({"fighting", "dragon", "dark"}, {"fire", "poison", "steel"}, set()),
 }
 
-def _type_multiplier(move_type, target_species):
-    if not move_type:
-        return 1.0
-    target = _name(target_species)
-    defending = _TYPES.get(target) or _MORE_SPECIES_TYPES.get(target)
-    if not defending:
-        return 1.0
-    impact = 1.0
-    for defending_type in defending:
-        impact *= _TYPE_CHART.get(move_type, {}).get(defending_type, 1.0)
-    return impact
+
+def _pokemon_id(name: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
 
 
-class MatchupPokemonCoach(PokemonCoach):
-    """Net benefit = pressure, KO potential, setup tempo, safety and type matching.
+def _type_multiplier(move_type: str, defending_types: list[str]) -> float:
+    strong, resist, immune = _TYPE_CHART.get(str(move_type).lower(), (set(), set(), set()))
+    multiplier = 1.0
+    for t in defending_types:
+        t = str(t).lower()
+        if t in immune:
+            return 0.0
+        multiplier *= 2 if t in strong else (0.5 if t in resist else 1)
+    return multiplier
 
-    These are estimates rather than a full Showdown damage simulator. It never
-    creates a new action: only scores options already offered by the server.
+
+class PokemonReference:
+    """Optional local Showdown metadata; no network requests during a match.
+
+    Run scripts/setup_pokemon_reference.py ONCE on the machine running Riffo
+    to get the public Pokedex/move data. If missing, play normally without it.
     """
-    def __init__(self, *, log=print):
-        super().__init__(log=log)
-        self.active_species = {}
-        self.current_target_species = {}
-        self.current_target_hps = {}
+    def __init__(self):
+        self.species, self.moves = {}, {}
+        try:
+            file = Path(__file__).with_name('pokemon_reference.json')
+            if file.is_file():
+                data = json.loads(file.read_text(encoding='utf-8'))
+                self.species = _dict(data.get('species'))
+                self.moves = _dict(data.get('moves'))
+        except (OSError, ValueError, TypeError):
+            pass
 
-    def _score_move(self, option, slot, target, last_target, reserved_setup=None):
-        base = super()._score_move(option, slot, target, last_target, reserved_setup)
-        if option.get('type') != 'move':
-            return base
-        move = _name(option.get('move_id'))
-        move_type = _name(option.get('move_type') or option.get('element') or _MOVE_TYPES.get(move))
-        # Subtract the old, incomplete type bonus (it incorrectly treats resisted
-        # dual-type matchups as pure super-effective damage).
-        if type(target) is int and target > 0:
-            base -= _target_matchup_bonus(option, target)
-        # Do not give a large *fixed* bonus to a move that is immune/resisted.
-        base -= 0.75 * _MOVE_BONUS.get(move, 0)
-        power = option.get('base_power', option.get('power'))
-        if type(power) not in (int, float):
-            power = _MOVE_POWER_ESTIMATE.get(move)
-        if power is None:
-            # A new attack move whose power is unknown should not be scored as
-            # zero; novel status moves get some benefit from the existing policy.
-            power = 60 if move not in _MOVE_BONUS else 0
-        if power > 0:
-            attacker = _name(self.active_species.get(slot, ''))
-            stab = 1.5 if move_type and move_type in (_TYPES.get(attacker) or _MORE_SPECIES_TYPES.get(attacker) or ()) else 1.0
-            multiplier = 1.0
-            if type(target) is int and target > 0:
-                species = next((x.get('species') for x in option.get('target_options', [])
-                                if isinstance(x, dict) and x.get('target') == target), None)
-                species = species or self.current_target_species.get(target)
-                multiplier = _type_multiplier(move_type, species)
-            accuracy = option.get('accuracy', 100)
-            accuracy = accuracy / 100 if type(accuracy) in (int, float) and 0 < accuracy <= 100 else 1.0
-            damage_proxy = float(power) * stab * multiplier * accuracy
-            base += min(170, damage_proxy * 0.72)
-            if multiplier == 0:
-                base -= 180  # Known type immunity: avoid wasting the move.
-            elif multiplier < 1:
-                base -= 25
-            elif multiplier >= 2:
-                base += 14
-            if type(target) is int and target > 0:
-                hp = self.current_target_hps.get(target)
-                if type(hp) in (int,float) and 0 < hp <= 1:
-                    base += 22 * (1-hp) * min(2, multiplier)
-        # Avoid blindly spamming early-game utility with no benefit after setup.
-        if move in {'tailwind', 'trickroom'} and move in self.used_setup:
-            base -= 75
-        if move in {'protect', 'detect'} and self.last_moves.get(slot) in {'protect','detect'}:
-            base -= 50
-        if move in {'explosion', 'selfdestruct', 'memento', 'finalgambit'}:
-            base -= 100
-        return base
+    def brief(self, observation: Any, options: Any) -> dict:
+        """Extract only Pokémon and moves observed by this player."""
+        species, moves = set(), set()
 
-
-class MatchupHybridPokemon(HybridPokemon):
-    """AI chooses from matchup-ranked legal alternatives, with local fallback."""
-    def __init__(self, provider, *, log=print):
-        super().__init__(provider, log=log)
-        self.local = MatchupPokemonCoach(log=lambda *_: None)
-        self.drafted_species = []
-
-    def _alternatives(self, state):
-        first = state.legal_actions[0] if state.legal_actions else None
-        if first and first.action_id == 'doubles_turn':
-            template = first.input.get('action') or {}
-            slots = template.get('slots') or []
-            self.local.active_species = {}
-            self.local.current_target_species = {}
-            self.local.current_target_hps = {}
-            for idx, slot in enumerate(slots):
-                if not isinstance(slot, dict):
+        def scan(obj: Any, depth: int = 0):
+            if depth > 9:
+                return
+            if isinstance(obj, dict):
+                for key, val in obj.items():
+                    if key in ('species', 'baseSpecies') and isinstance(val, str):
+                        species.add(_pokemon_id(val))
+                    if key == 'move_id' and isinstance(val, str):
+                        moves.add(_pokemon_id(val))
+                    if key == 'is' and isinstance(val, str) and val.startswith('OPPONENT '):
+                        species.add(_pokemon_id(val[len('OPPONENT '):]))
+                    if key in ('roster', 'bring', 'leads', 'opponent_roster', 'picks', 'drafted', 'team') and isinstance(val, list):
+                        for x in val:
+                            if isinstance(x, str):
+                                species.add(_pokemon_id(x))
+                    scan(val, depth + 1)
+            elif isinstance(obj, list):
+                for x in obj[:90]:
+                    scan(x, depth + 1)
+        scan(observation)
+        scan(options)
+        brief = {
+            'species': {key: self.species[key] for key in sorted(species) if key in self.species},
+            'moves': {key: self.moves[key] for key in sorted(moves) if key in self.moves},
+        }
+        # Exact move-vs-target matchups derived from the full type chart and
+        # Showdown species data; they are FACTS for the AI, not local rankings.
+        annotations = []
+        for slot in _dict(options).get('slots') or []:
+            for opt in _dict(slot).get('options') or []:
+                move_id = _pokemon_id(_dict(opt).get('move_id'))
+                move = self.moves.get(move_id, {})
+                if _dict(opt).get('type') != 'move' or not move.get('power'):
                     continue
-                number = slot.get('slot', idx)
-                active = slot.get('active') or {}
-                if isinstance(active, dict):
-                    self.local.active_species[number] = active.get('species', '')
-                for option in slot.get('options') or []:
-                    for target in option.get('target_options') or []:
-                        if isinstance(target, dict) and type(target.get('target')) is int and target['target'] > 0:
-                            self.local.current_target_species[target['target']] = target.get('species', '')
-            candidates = super()._alternatives(state)
-            for candidate in candidates:
-                action = candidate['action']
-                for i in (0, 1):
-                    slot_choice = action.get(f'slot_{i}', {})
-                    if slot_choice.get('type') == 'move':
-                        move = _name(slot_choice.get('move_id'))
-                        target = slot_choice.get('target')
-                        opponent = self.local.current_target_species.get(target, '')
-                        kind = _name(_MOVE_TYPES.get(move))
-                        candidate['description'] += (
-                            f'; slot{i}: {move} on {opponent or target}'
-                            f' (estimated type effectiveness {_type_multiplier(kind, opponent):g}x)')
-            return candidates
-        candidates = super()._alternatives(state)
-        if first and first.action_id.startswith('draft_pick:'):
-            # A team with 3 speed setters is not automatically stronger than
-            # a balanced team. Penalize role redundancy once a role is filled.
-            have_speed = any(_name(x) in {'tornadus','whimsicott','murkrow'} for x in self.drafted_species)
-            have_fakeout = any(_name(x) in {'incineroar','rillaboom','ironhands'} for x in self.drafted_species)
-            for candidate in candidates:
-                action = candidate['action']
-                obs = state.raw.get('observation') or {}
-                cards = obs.get('available_cards') or []
-                card = next((x for x in cards if isinstance(x, dict) and str(x.get('card_id')) == action.action_id.partition(':')[2]), {})
-                species = card.get('species') or action.label or ''
-                key = _name(species)
-                if key in {'tornadus','whimsicott','murkrow'} and not have_speed:
-                    candidate['utility'] += 9
-                if key in {'tornadus','whimsicott','murkrow'} and have_speed:
-                    candidate['utility'] -= 12
-                if key in {'incineroar','rillaboom','ironhands'} and not have_fakeout:
-                    candidate['utility'] += 6
-                candidate['description'] += f'; existing team={self.drafted_species}'
-            return sorted(candidates, key=lambda row: -row['utility'])
-        return candidates
-
-    def choose_action(self, state, context):
-        answer = super().choose_action(state, context)
-        if state.legal_actions and state.legal_actions[0].action_id.startswith('draft_pick:'):
-            chosen = answer.action if isinstance(answer, WithReasoning) else answer
-            label = chosen.action_id if hasattr(chosen, 'action_id') else str(chosen)
-            obs = state.raw.get('observation') if isinstance(state.raw, dict) else {}
-            cards = obs.get('available_cards') or [] if isinstance(obs, dict) else []
-            card = next((x for x in cards if isinstance(x, dict) and str(x.get('card_id')) == label.partition(':')[2]), {})
-            species = card.get('species') or getattr(chosen, 'label', None)
-            if species and species not in self.drafted_species:
-                self.drafted_species.append(species)
-        action = answer.action if isinstance(answer, WithReasoning) else answer
-        if isinstance(action, dict) and action.get('type') == 'doubles_turn':
-            moves = []
-            for slot_num in (0, 1):
-                chosen = action.get(f'slot_{slot_num}', {})
-                moves.append(f"slot{slot_num}={chosen.get('move_id', chosen.get('species', chosen.get('type')))} target={chosen.get('target', '-')}")
-            self.log('[riffo] Pokemon selected: ' + ', '.join(moves))
-        elif hasattr(action, 'action_id') and str(action.action_id).startswith('draft_pick:'):
-            self.log('[riffo] Pokemon draft picked ' + str(getattr(action, 'label', None) or action.action_id))
-        return answer
+                for target in _dict(opt).get('targets') or []:
+                    if not isinstance(target, dict):
+                        continue
+                    described = str(target.get('is', ''))
+                    if not described.startswith('OPPONENT '):
+                        continue
+                    who = _pokemon_id(described[len('OPPONENT '):])
+                    foe = self.species.get(who)
+                    if not foe:
+                        continue
+                    factor = _type_multiplier(move.get('type', ''), foe.get('types', []))
+                    annotations.append({'move':move_id, 'opponent':who,
+                                        'target':target.get('target'), 'type_multiplier':factor})
+        if annotations:
+            brief['visible_move_matchups_BASE_TYPES_ONLY'] = annotations[:70]
+        return brief
 
 
+class FastRedAlert:
+    """Local RTS actuator; the model chooses *goals*, never delays every order.
 
-
-# ---------------------------------------------------------------------------
-# Riffo v5.2: economy-first real-time planning and opponent-aware VGC draft.
-# ---------------------------------------------------------------------------
-
-class EconomyFirstRedAlert(HybridRedAlert):
-    """Fast multi-order economic growth before a coordinated assault.
-
-    Every decision is state-driven. A small local utility model prices the
-    opportunity cost of construction/training, while GPT-4o mini periodically
-    evaluates higher-level batches. No guessed unit ids or targets are sent.
+    - Do mandatory actions (deploy, place) immediately.
+    - Maintain construction, defense, harvesters and a funded production queue.
+    - Ask the model for a high-level strategy periodically, with a hard timeout.
+    - Never invent unit IDs, targets, or production item names.
     """
-    MAX_LLM_CALLS = 9
-    LLM_INTERVAL = 55.0
-    MIN_ATTACK_FORCE = 13
-    # Spend less up front to keep the refinery / factory construction path open.
-    COSTS = {'powr': 300, 'tent': 300, 'barr': 300, 'proc': 2000,
-             'weap': 2000, 'e1': 100, 'e3': 300, '1tnk': 700,
-             '2tnk': 800, '3tnk': 950, 'harv': 1400}
-    STRUCTURES = {'fact','powr','apwr','tent','barr','proc','weap',
-                  'afld','silo','dome','stek','atek','hpad','fix',
-                  'gun','ftur','tsla','sam','agun','mslo','iron','pdox'}
-    NONCOMBAT = {'mcv','harv','harvester','truk','truck','miner','dog'}
-    # Don't clog building queues with the same speculative structure.
+    BASE_COST = {"powr": 300, "apwr": 500, "barr": 300, "tent": 300,
+                 "proc": 2000, "weap": 2000, "e1": 100, "e2": 150,
+                 "e3": 300, "1tnk": 700, "2tnk": 800, "3tnk": 950,
+                 "harv": 1400, "arty": 600}
+    STRUCTURES = {"powr", "apwr", "barr", "tent", "proc", "weap", "afld", "silo",
+                  "dome", "stek", "atek", "hpad", "fix", "gun", "ftur", "tsla",
+                  "sam", "agun", "mslo", "iron", "pdox"}
+    NONCOMBAT = {"mcv", "harv", "harvester", "truk", "truck", "miner"}
 
-    def __init__(self, provider, *, log=print, clock=time.monotonic):
-        super().__init__(provider, log=log, clock=clock)
-        self._previous_orders: list[dict] = []
-        self._reported_signature = ''
-        self._model_provider = provider
-
-    @staticmethod
-    def _order_key(order):
-        # Defensive fire at a particular intruder must not share the long
-        # cooldown for cross-map attack_move commands.
-        if order.get('cmd')=='attack':
-            return 'defend:'+str(order.get('target'))
-        return FastRedAlert._order_key(order)
+    def __init__(self, provider: Any, *, log=print, clock=time.monotonic):
+        self.provider, self.log, self.clock = provider, log, clock
+        self.cooldowns: dict[str, float] = {}
+        self.last_batch: list[dict] = []
+        self.strategy = "balanced"
+        self.priority = "economy"
+        self.ai_calls = 0
+        self.ai_limit = max(0, min(24, int(os.getenv("RIFFO_RTS_AI_CALLS", "12"))))
+        self.last_ai = clock()
+        self.last_status = clock()
+        self.strategy_results = queue.SimpleQueue()
+        self.strategy_busy = False
+        self.last_order_report = None
+        self.last_problem_signature = None
 
     @staticmethod
-    def _valid_ids(units):
-        return [u['id'] for u in units if type(u.get('id')) is int and not u.get('wreck')]
+    def _type(row: dict) -> str:
+        return str(row.get("type", "")).lower()
 
-    def _planning_facts(self, raw):
-        obs=raw.get('observation') if isinstance(raw.get('observation'),dict) else {}
-        units=self._objects(obs.get('units'))
-        buildings=self._objects(obs.get('buildings'))
-        queues=self._objects(obs.get('production'))
-        names=[self._text_type(b.get('type')) for b in buildings]
-        queued=[self._text_type(p.get('item')) for p in queues]
-        available={str(s).lower() for s in obs.get('available_production', []) if isinstance(s,str)}
-        econ=obs.get('economy') if isinstance(obs.get('economy'),dict) else {}
-        cash=_safe_float(econ.get('cash'), 2500)
-        power=_safe_float(econ.get('power_provided'))
-        drain=_safe_float(econ.get('power_drained'))
-        combat=[u for u in units if self._text_type(u.get('type')) not in self.NONCOMBAT and not u.get('wreck')]
-        harvesters=[u for u in units if self._text_type(u.get('type')) in {'harv','harvester','miner'} and not u.get('wreck')]
-        return obs,units,names,queues,queued,available,cash,power,drain,combat,harvesters
+    @staticmethod
+    def _key(order: dict) -> str:
+        cmd = order.get("cmd")
+        if cmd in ("attack", "attack_move"):
+            return f"{cmd}:{order.get('target', order.get('to', ''))}"
+        return f"{cmd}:{order.get('item', '')}:{','.join(map(str, order.get('units', [])))}"
 
-    def _ready_to_attack(self, raw, facts=None):
-        f=facts or self._planning_facts(raw)
-        _,_,names,_,_,_,cash,_,_,combat,_=f
-        # A few scattered rifle infantry should not be committed to a base assault.
-        tank_count=sum(self._text_type(u.get('type')) in {'1tnk','2tnk','3tnk','4tnk','arty'} for u in combat)
-        army_value=len(combat)+2*tank_count
-        if 'proc' not in names:
-            return False
-        if army_value < self.MIN_ATTACK_FORCE:
-            return False
-        obs=f[0]
-        visible=[x for x in self._objects(obs.get('visible_enemies'))
-                 if self._text_type(x.get('type')) not in self.NONCOMBAT]
-        enemy_armor=sum(self._text_type(x.get('type')) in {'1tnk','2tnk','3tnk','4tnk','arty'}
-                        for x in visible)
-        visible_enemy_value=len(visible)+2*enemy_armor
-        # Attacking into a larger army is especially bad when a resource lead
-        # can be preserved and converted into a late-game tiebreak victory.
-        if visible_enemy_value>0 and army_value < visible_enemy_value*1.1:
-            return False
-        # Prefer to establish a productive base before destroying the army.
-        return 'weap' in names or army_value>=22
+    def _free(self, order: dict, seconds: float) -> bool:
+        return self.clock() >= self.cooldowns.get(self._key(order), 0)
 
-    def _can_afford(self, item, available, cash, reserve=0):
-        return item in available and cash >= self.COSTS.get(item, 500)+reserve
+    def _cost(self, item: str, context: Any) -> int:
+        rules = _dict(_dict(getattr(context, "game_config", {})).get("rules"))
+        for k in ("units", "buildings"):
+            cost = _dict(_dict(rules.get(k)).get(item)).get("cost")
+            if type(cost) in (int, float) and 0 <= cost < 100000:
+                return int(cost)
+        return self.BASE_COST.get(item, 600)
 
-    def _build_plan(self, raw):
-        f=self._planning_facts(raw)
-        obs,units,names,queues,queued,available,cash,power,drain,combat,harvesters=f
-        legal=raw.get('legal_actions') if isinstance(raw.get('legal_actions'),dict) else {}
-        orders=[]; notes=[]
-        now=self._clock()
+    @staticmethod
+    def _xy(o: Any) -> tuple[float, float] | None:
+        if isinstance(o, (list, tuple)) and len(o) >= 2 and all(type(x) in (int, float) for x in o[:2]):
+            return float(o[0]), float(o[1])
+        if isinstance(o, dict):
+            if type(o.get("x")) in (int, float) and type(o.get("y")) in (int, float):
+                return float(o["x"]), float(o["y"])
+            return FastRedAlert._xy(o.get("cell") or o.get("position"))
+        return None
 
-        def add(order, cooldown, reason):
-            if not self._can_send(order,cooldown):
+    def _strategy_worker(self, payload: dict):
+        """Model calls never block the ~5Hz game loop."""
+        schema = object_schema({
+            "stance": {"type": "string", "enum": ["balanced", "defensive", "aggressive"]},
+            "priority": {"type": "string", "enum": ["economy", "infantry", "armor"]},
+            "reason": {"type": "string"},
+        }, reasoning=False)
+        try:
+            ans = self.provider.complete_structured([
+                {"role": "system", "content": (
+                    "You are an OpenRA Red Alert real-time commander. Choose goals for the next 40 seconds, "
+                    "not individual commands. First establish two productive refineries, a barracks, "
+                    "and a war factory; maintain harvesting, power and army output. If enemy forces "
+                    "threaten the base, defend immediately. Do not waste troops or send harvesters into combat. "
+                    "Use only observed facts; respond with strict JSON.")},
+                {"role": "user", "content": _json(payload, 9500)},
+            ], "riffo_rts_strategy", schema, timeout=3.0)
+            self.strategy_results.put(ans)
+        except (ProviderError, ValueError, TypeError, KeyError, TimeoutError) as exc:
+            self.strategy_results.put({"error": type(exc).__name__})
+
+    def _ask_strategy(self, raw: dict, context: Any):
+        # Consume completed advice without ever waiting for the API. Game time
+        # continues while network requests run, so synchronous GPT calls are bad.
+        try:
+            ans = self.strategy_results.get_nowait()
+        except queue.Empty:
+            ans = None
+        if ans is not None:
+            self.strategy_busy = False
+            if ans.get("stance") in ("balanced", "defensive", "aggressive"):
+                self.strategy = ans["stance"]
+            if ans.get("priority") in ("economy", "infantry", "armor"):
+                self.priority = ans["priority"]
+            if "error" in ans:
+                self.log("[riffo6.2] RTS strategist unavailable; macro runs independently")
+            else:
+                self.log(f"[riffo6.2] RTS strategy={self.strategy}, priority={self.priority}")
+        if (self.strategy_busy or self.ai_calls >= self.ai_limit or
+                self.clock() - self.last_ai < 40):
+            return
+        obs = _dict(raw.get("observation"))
+        self.last_ai = self.clock()
+        self.ai_calls += 1
+        self.strategy_busy = True
+        payload = {
+            "time": raw.get("time"), "economy": obs.get("economy"),
+            "buildings": [self._type(r) for r in _rows(obs.get("buildings"))],
+            "units": dict(Counter(self._type(r) for r in _rows(obs.get("units")) if not r.get("wreck"))),
+            "visible_enemy_units": dict(Counter(self._type(r) for r in _rows(obs.get("visible_enemies")))),
+            "production": _rows(obs.get("production"))[:14],
+            "available": obs.get("available_production"),
+            "last_orders": raw.get("last_orders"),
+            "recent_order_problems": raw.get("recent_order_problems"),
+            "current_strategy": {"stance": self.strategy, "priority": self.priority},
+        }
+        threading.Thread(target=self._strategy_worker, args=(payload,), daemon=True).start()
+
+    def _observe_verdicts(self, raw: dict):
+        """Show actual *per-order* failures, not only whole batch errors."""
+        last = _dict(raw.get("last_orders"))
+        marker = (last.get("batch"), last.get("pending"))
+        if marker[0] is not None and marker != self.last_order_report and not last.get("pending"):
+            self.last_order_report = marker
+            rejected = [r for r in _rows(last.get("results")) if
+                        str(r.get("status", "")).lower() in ("rejected", "failed", "invalid", "error", "denied") or
+                        str(r.get("reason", "")).lower() not in ("", "ok", "success", "accepted")]
+            if rejected:
+                self.log("[riffo6.2] RTS per-order results: " + _json(rejected[:5], 700))
+        problems = _rows(raw.get("recent_order_problems"))
+        if problems:
+            signature = _json(problems[-3:], 900)
+            if signature != self.last_problem_signature:
+                self.last_problem_signature = signature
+                self.log("[riffo6.2] RTS recent order problems: " + signature)
+
+    def choose_action(self, state: Any, context: Any):
+        raw = _dict(getattr(state, "raw", {}))
+        obs = _dict(raw.get("observation"))
+        if not obs:
+            return WAIT
+        self._observe_verdicts(raw)
+        self._ask_strategy(raw, context)
+        units = _rows(obs.get("units"))
+        buildings = _rows(obs.get("buildings"))
+        prod = _rows(obs.get("production"))
+        available = {v.lower() for v in (obs.get("available_production") or []) if isinstance(v, str)}
+        names = [self._type(b) for b in buildings]
+        queued = [str(p.get("item", "")).lower() for p in prod]
+        econ = _dict(obs.get("economy"))
+        cash = econ.get("cash")
+        cash = float(cash) if type(cash) in (int, float) else 0.0
+        power = econ.get("power_provided", 0)
+        drain = econ.get("power_drained", 0)
+        power = float(power) if type(power) in (int, float) else 0.0
+        drain = float(drain) if type(drain) in (int, float) else 0.0
+        combat = [u for u in units if self._type(u) not in self.NONCOMBAT and not u.get("wreck") and type(u.get("id")) is int]
+        harvesters = [u for u in units if self._type(u) in ("harv", "harvester", "miner") and not u.get("wreck")]
+        orders: list[dict] = []
+        remaining = cash
+
+        def add(order: dict, cooldown: float = 10, cost: int = 0) -> bool:
+            nonlocal remaining
+            if not self._free(order, cooldown) or cost > remaining:
                 return False
-            orders.append(order); notes.append(reason)
+            orders.append(order)
+            remaining -= cost
             return True
 
-        # Only use observed ids. An MCV changes identity when deployed.
+        # Urgent construction actions: never wait for an LLM.
         for u in units:
-            if self._text_type(u.get('type'))=='mcv' and type(u.get('id')) is int:
-                add({'cmd':'deploy','units':[u['id']]}, 8, 'deploy MCV')
+            if self._type(u) == "mcv" and type(u.get("id")) is int:
+                add({"cmd": "deploy", "units": [u["id"]]}, 8)
                 break
         if orders:
-            return orders,notes
+            return self._send(orders, context, "Deploy construction yard")
+        for p in prod:
+            item = str(p.get("item", "")).lower()
+            if p.get("ready") is True and item in self.STRUCTURES:
+                if add({"cmd": "place", "item": item}, 8):
+                    return self._send(orders, context, f"Place completed {item}")
 
-        # Structures ready in construction queue must be placed to unlock the next one.
-        for p in queues:
-            item=self._text_type(p.get('item'))
-            if p.get('ready') is True and item in self.STRUCTURES:
-                if add({'cmd':'place','item':item},10, 'place '+item):
-                    return orders,notes
+        # Grow the *productive economy*, not just immediate troop count.
+        # The old policy tried to save for refinery #2, then spent the savings
+        # on a large unit batch every observation. Keep a real capital reserve.
+        has = lambda item: item in names or item in queued
+        count = lambda item: names.count(item) + queued.count(item)
+        has_barracks = any(has(t) for t in ("barr", "tent"))
+        refineries = count("proc")
+        factories = count("weap")
+        enemy_close = False
+        center = self._xy(obs.get("base_center"))
+        if center:
+            enemy_close = any(self._xy(e) and
+                (self._xy(e)[0]-center[0])**2+(self._xy(e)[1]-center[1])**2 < 19**2
+                for e in _rows(obs.get("visible_enemies")))
+        # Do not queue a second powr just because power usage is high.
+        # Build it only when current draw exceeds generation or a known
+        # next building needs power (the latter is left to actual rules).
+        critical = None
+        if not has("powr") and "powr" in available:
+            critical = "powr"
+        elif not has_barracks:
+            critical = next((t for t in ("barr", "tent") if t in available), None)
+        elif refineries == 0:
+            critical = "proc" if "proc" in available else None
+        elif power > 0 and drain >= power and "powr" in available and not has("apwr"):
+            critical = "powr"
+        elif refineries < 2 and "proc" in available and not enemy_close:
+            # OpenRA double-refinery opening: queue refinery as soon as it is
+            # affordable. Save rather than divert its capital into the factory.
+            critical = "proc"
+        elif factories == 0:
+            critical = "weap" if "weap" in available else None
+        elif refineries < 2 and "proc" in available:
+            critical = "proc"
+        elif power > 0 and drain >= power * 0.94 and "powr" in available:
+            critical = "powr"
+        elif refineries >= 2 and factories >= 1 and count("barr")+count("tent") < 2 and cash >= 2500:
+            critical = next((t for t in ("barr", "tent") if t in available and not has(t)), None)
+        elif refineries >= 2 and factories == 1 and cash >= 3800 and "weap" in available:
+            critical = "weap"
+        if critical and critical not in queued:
+            add({"cmd": "build", "item": critical}, 5, self._cost(critical, context))
 
-        # Build at most one structure each observation. Cash is a scarce resource.
-        has=lambda x:x in names or x in queued
-        to_build=None; why=''
-        if 'powr' in available and (not has('powr') or (power>0 and drain>=power*0.92 and not any(p.get('item')=='powr' for p in queues))):
-            to_build='powr'; why='power capacity'
-        elif not (has('tent') or has('barr')):
-            to_build=next((x for x in ('tent','barr') if x in available),None);why='early infantry access'
-        elif not has('proc'):
-            to_build='proc';why='first refinery and income'
-        elif not has('weap'):
-            to_build='weap';why='vehicle production'
-        elif names.count('proc')<2 and queued.count('proc')==0 and len(harvesters)<2 and cash>=2800:
-            to_build='proc';why='second refinery and income'
-        elif names.count('powr')<2 and queued.count('powr')==0 and power>0 and drain>=power*0.8:
-            to_build='powr';why='power headroom'
+        # Defend the real base from *visible* enemies using real unit IDs.
+        base = self._xy(obs.get("base_center"))
+        enemies = _rows(obs.get("visible_enemies"))
+        nearby = [e for e in enemies if base and self._xy(e) and type(e.get("id")) is int
+                  and (self._xy(e)[0] - base[0])**2 + (self._xy(e)[1] - base[1])**2 <= 15**2]
+        if nearby and combat:
+            nearby.sort(key=lambda e: (self._xy(e)[0] - base[0])**2 + (self._xy(e)[1] - base[1])**2)
+            add({"cmd": "attack", "units": [u["id"] for u in combat[:35]], "target": nearby[0]["id"]}, 8)
 
-        if to_build and to_build in available and to_build not in queued and self._can_afford(to_build,available,cash,0):
-            add({'cmd':'build','item':to_build}, 25, 'build '+to_build+' ('+why+')')
+        # Income first; a refinery comes with a harvester under current rules.
+        if has("weap") and len(harvesters) < 2 and "harv" in available and "harv" not in queued:
+            add({"cmd": "train", "item": "harv", "count": 1}, 28, self._cost("harv", context))
+        for h in harvesters:
+            if h.get("idle") is True and type(h.get("id")) is int:
+                if add({"cmd": "harvest", "units": [h["id"]]}, 18):
+                    break
 
-        # Keep production going *alongside* building. Avoid e1 x2 endlessly.
-        # When upgrading economy, do not burn the money reserved for proc/weap.
-        reserv=0
-        if not has('proc'):
-            reserv=2000
-        elif not has('weap'):
-            reserv=1800
-        if orders and orders[0]['cmd']=='build':
-            new_structure = orders[0]['item']
-            cash -= self.COSTS.get(new_structure, 500)
-            # That expensive structure has already been funded in this batch;
-            # reserving its entire price a second time would stall production.
-            if new_structure in {'proc', 'weap'}:
-                reserv = 500
-        budget=max(0,cash-reserv)
-        queue_types=[self._text_type(p.get('queue')) for p in queues]
-        already_queued=sum(1 for p in queues if self._text_type(p.get('item')) in {'e1','e2','e3','1tnk','2tnk','3tnk','harv'})
-        # Harvesters are critical for scaling, but choose only actually available items.
-        need_harv=len(harvesters)<2 and 'weap' in names
-        if need_harv and 'harv' in available and 'harv' not in queued and budget>=self.COSTS['harv']:
-            add({'cmd':'train','item':'harv','count':1}, 38, 'train income harvester')
-        elif already_queued < 4 and budget>=300:
-            # Favor tanks once the factory is online; use rifle infantry for mass.
-            if 'weap' in names:
-                unit=next((x for x in ('3tnk','2tnk','1tnk') if x in available),None)
+        # Reserve resources for the next infrastructure step. Troop batches
+        # are intentionally small while the first two refineries are pending.
+        reserve = 0
+        if refineries == 0:
+            reserve = self._cost("proc", context)
+        elif refineries < 2:
+            reserve = self._cost("proc", context)
+        elif factories == 0:
+            reserve = min(self._cost("weap", context), 1700)
+        # A nearby attack takes precedence over saving everything for growth.
+        if nearby and len(combat) < 7:
+            reserve = min(reserve, 300)
+        training = {str(p.get("item", "")).lower() for p in prod
+                    if str(p.get("queue", "")).lower() not in ("building", "defense")}
+        if remaining > reserve + 100 and len(training) <= 2:
+            if self.priority == "armor" and "weap" in names:
+                preferred = ("3tnk", "2tnk", "1tnk", "e3", "e1")
+            elif self.priority == "infantry" or nearby:
+                preferred = ("e1", "e3", "2tnk", "1tnk", "3tnk")
             else:
-                unit=None
-            if not unit:
-                unit=next((x for x in ('e3','e1','e2') if x in available),None)
-            if unit:
-                unit_cost=self.COSTS.get(unit,150)
-                count=min(10,int(budget//unit_cost))
-                if count>=1:
-                    # Send a substantial queue (not e1 x2 per 20 seconds).
-                    add({'cmd':'train','item':unit,'count':count}, 28,
-                        'train '+unit+' x'+str(count))
+                preferred = ("2tnk", "3tnk", "1tnk", "e1", "e3") if "weap" in names else ("e1", "e3")
+            for item in preferred:
+                if item in available and item not in training:
+                    cost = self._cost(item, context)
+                    affordable = int(max(0, remaining-reserve)//max(1, cost))
+                    # Feed production continuously, without spending the
+                    # entire construction budget in one speculative queue.
+                    max_batch = 3 if refineries < 2 else (5 if len(combat) < 12 else 8)
+                    batch = min(affordable, max_batch)
+                    if batch and add({"cmd": "train", "item": item, "count": batch}, 5, batch*cost):
+                        break
 
-        # A known idle harvester should harvest, not join an assault.
-        for h in harvesters[:2]:
-            if h.get('idle') is True and type(h.get('id')) is int:
-                add({'cmd':'harvest','units':[h['id']]},28,'resume harvesting')
-                break
+        # When materially stronger and economically developed, the server's
+        # 'attack_now' carries legal IDs/coordinates; never synthesize a map target.
+        legal = _dict(raw.get("legal_actions"))
+        attack = legal.get("attack_now")
+        army_strength = len(combat) + 2 * sum(self._type(u) in ("1tnk", "2tnk", "3tnk", "4tnk") for u in combat)
+        if self.strategy == "aggressive":
+            threshold = 12
+        elif self.strategy == "defensive":
+            threshold = 23
+        else:
+            threshold = 16
+        if has("proc") and has("weap") and army_strength >= threshold and not nearby and isinstance(attack, dict):
+            enemy_combat = [u for u in enemies if self._type(u) not in self.NONCOMBAT]
+            if army_strength >= len(enemy_combat) * 1.3:
+                selected = [u.get("id") for u in combat if type(u.get("id")) is int]
+                suggested = dict(attack)
+                if suggested.get("cmd") in ("attack", "attack_move"):
+                    # Server supplies target; keep its legal unit subset.
+                    if isinstance(suggested.get("units"), list):
+                        allowed = set(selected)
+                        suggested["units"] = [i for i in suggested["units"] if i in allowed][:50]
+                    if len(suggested.get("units") or []) >= 8:
+                        add(suggested, 33)
 
-        # Respond to nearby enemy raids without confusing defense with a
-        # premature cross-map assault. Attack a visible enemy near our base;
-        # only use authoritative enemy and our-own unit IDs.
-        base=obs.get('base_center')
-        if isinstance(base,dict):
-            base=(base.get('x'),base.get('y'))
-        if isinstance(base,(tuple,list)) and len(base)>=2 and all(type(v) in (int,float) for v in base[:2]):
-            foes=[]
-            for enemy in self._objects(obs.get('visible_enemies')):
-                pos=(enemy.get('x'),enemy.get('y'))
-                if not all(type(v) in (int,float) for v in pos):
-                    cell=enemy.get('cell')
-                    if isinstance(cell,(tuple,list)) and len(cell)>=2:
-                        pos=cell[:2]
-                if type(enemy.get('id')) is int and all(type(v) in (int,float) for v in pos):
-                    dist2=(pos[0]-base[0])**2+(pos[1]-base[1])**2
-                    if dist2<=16**2: foes.append((dist2,enemy))
-            if foes and len(combat)>=2:
-                threat=min(foes,key=lambda row:row[0])[1]
-                defenders=self._valid_ids(combat)[:18]
-                if defenders:
-                    add({'cmd':'attack','units':defenders,'target':threat['id']},20,
-                        'defend base against visible enemy')
+        if self.clock() - self.last_status > 15:
+            self.last_status = self.clock()
+            self.log(f"[riffo6.2] RTS cash={int(cash)} power={int(power)}/{int(drain)} "
+                     f"buildings={','.join(names)} military={len(combat)} harvesters={len(harvesters)} "
+                     f"queue={','.join(queued)} available={','.join(sorted(available))}")
+        return self._send(orders, context, f"RTS {self.strategy}: {self.priority}") if orders else WAIT
 
-        # Hold army until it is big enough; do not march 1-4 riflemen to death.
-        attack=legal.get('attack_now')
-        if self._ready_to_attack(raw,f) and isinstance(attack,dict) and attack.get('cmd'):
-            # Attack group is provided by the server. Never fabricate coordinates.
-            if len(attack.get('units') or [])>=6:
-                add(attack,48, 'coordinated attack with '+str(len(attack['units']))+' units')
-
-        return orders[:20],notes
-
-    def _accept_model(self, raw, model_action, local):
-        if not isinstance(model_action,WithReasoning) or not isinstance(model_action.action,dict):
-            return None
-        candidate=model_action.action.get('orders')
-        if not isinstance(candidate,list) or not candidate:
-            return None
-        # Check SDK syntax; then filter economically self-defeating orders.
-        valid,dropped=validate_orders(candidate,order_fields(None),_limits(raw))
-        if dropped or not valid:
-            return None
-        f=self._planning_facts(raw)
-        _,units,names,queues,queued,available,cash,_,_,_,_=f
-        reserved=0
-        kept=[]
+    def _send(self, orders: list[dict], context: Any, reason: str):
+        config = _dict(getattr(context, "game_config", {}))
+        valid, discarded = validate_orders(orders, order_fields(config), _limits({"limits": _dict(_dict(config.get("order_schema")).get("limits"))}))
+        if discarded:
+            self.log(f"[riffo6] RTS dropped {discarded} malformed orders")
+        if not valid:
+            return WAIT
+        now = self.clock()
         for order in valid:
-            cmd=order['cmd']; item=str(order.get('item') or '').lower()
-            if cmd in {'attack','attack_move'} and not self._ready_to_attack(raw,f):
-                continue
-            if cmd=='train':
-                if item not in available or not self._can_send(order,22): continue
-                reserved+=self.COSTS.get(item,400)*order.get('count',1)
-            elif cmd=='build':
-                if item not in available or item in queued or not self._can_send(order,20): continue
-                reserved+=self.COSTS.get(item,1200)
-            if reserved>cash:
-                continue
-            kept.append(order)
-        if not kept:
-            return None
-        # Maintain local economy steps even if AI suggests an attack-only plan.
-        critical={x['cmd'] for x in local if x['cmd'] in {'deploy','place','build'}}
-        if critical and not any(o['cmd'] in critical for o in kept):
-            return None
-        return kept
+            cd = 3 if order["cmd"] in ("attack", "deploy", "place") else 4
+            if order["cmd"] in ("build", "train"):
+                cd = 5
+            self.cooldowns[self._key(order)] = now + cd
+        self.last_batch = valid
+        self.log(f"[riffo6.2] RTS sent: " + "; ".join(f"{o['cmd']} {o.get('item', '')}{' x'+str(o['count']) if o.get('count') else ''}" for o in valid))
+        return WithReasoning({"type": "orders", "orders": valid}, reason)
 
-    def choose_action(self,state,context):
-        raw=state.raw
-        if not isinstance(raw.get('observation'),dict):
-            return WAIT
-        plan,notes=self._build_plan(raw)
-        now=self._clock()
-        # AI evaluates possible complex tactics occasionally, but local fast
-        # production continues even if the model times out or gives bad orders.
-        f=self._planning_facts(raw)
-        established='proc' in f[2] and 'weap' in f[2]
-        if (established and not any(o['cmd']=='attack' for o in plan)
-                and now-self._last_llm >= self.LLM_INTERVAL and self._llm.calls < self.MAX_LLM_CALLS):
-            self._last_llm=now
-            try:
-                proposed=self._llm.choose_action(state,context)
-                validated=self._accept_model(raw,proposed,plan)
-                if validated:
-                    # Score a complete accepted batch vs local; model must add utility.
-                    model_utility=sum(self._order_utility(o,raw) for o in validated)
-                    local_utility=sum(self._order_utility(o,raw) for o in plan)
-                    if model_utility>local_utility+12:
-                        plan=validated
-                        notes=['AI economic/military plan']
-                        self._last_was_llm=True
-            except (ProviderError,ValueError,TypeError,KeyError) as exc:
-                self._log('[riffo] Red Alert AI unavailable ('+type(exc).__name__+'); continuing economy plan')
-        if not plan:
-            return WAIT
-        for o in plan:
-            self._sent_at[self._order_key(o)]=self._clock()
-        self._previous_orders=list(plan)
-        self._last_order_key=None
-        self._log('[riffo] Red Alert: '+', '.join(notes))
-        return WithReasoning({'type':'orders','orders':plan}, '; '.join(notes)[:250])
-
-    def on_action_result(self,result,context):
-        # A rejected batch is never recorded in last_orders; retain reason and
-        # back off, rather than trying the same expensive action every frame.
-        if isinstance(result,dict) and (result.get('error')=='INVALID_ACTION' or result.get('accepted') is False):
-            for o in self._previous_orders:
-                self._rejected_until[self._order_key(o)]=self._clock()+32
-            self._log('[riffo] Red Alert: server rejected batch; retrying after cooldown')
-        self._previous_orders=[]
-        if self._last_was_llm:
-            self._llm.on_action_result(result,context)
-        self._last_was_llm=False
+    def on_action_result(self, result: dict, context: Any):
+        if isinstance(result, dict) and (result.get("error") == "INVALID_ACTION" or result.get("accepted") is False):
+            for order in self.last_batch:
+                self.cooldowns[self._key(order)] = self.clock() + 28
+            self.log("[riffo6] RTS refused batch; throttling rejected orders")
+        self.last_batch = []
 
 
-def _types_for(species):
-    name=_name(species)
-    return tuple(_TYPES.get(name) or _MORE_SPECIES_TYPES.get(name) or ())
+class RiffoAgent(LLMAgent):
+    """Expert-model decision maker using official schema-bound legal choices."""
 
-
-def _opponent_species(obs, my_seat=None):
-    """Extract only explicitly identified opponent rosters, never the draft pool."""
-    if not isinstance(obs,dict):
-        return []
-    names=[]
-    def collect(obj):
-        if isinstance(obj,str):
-            names.append(obj)
-        elif isinstance(obj,list):
-            for item in obj:
-                if isinstance(item,str): names.append(item)
-                elif isinstance(item,dict):
-                    name=item.get('species') or item.get('name')
-                    if name: names.append(name)
-        elif isinstance(obj,dict):
-            if isinstance(obj.get('species'),str): names.append(obj['species'])
-            for k in ('roster','team','picks','pokemon','cards','drafted'):
-                if k in obj: collect(obj[k])
-    for k in ('opponent_roster','opponent_team','opponent_picks','opponent_drafted',
-              'opp_roster','enemy_roster','enemy_team'):
-        collect(obs.get(k))
-    for k in ('opponent','enemy'):
-        if k in obs: collect(obs[k])
-    for k in ('draft','draft_state','teams'):
-        block=obs.get(k)
-        if isinstance(block,dict):
-            for k2 in ('opponent','enemy','opponent_roster','opponent_team'):
-                collect(block.get(k2))
-    # The draft state may use a public two-seat roster map. Select the OTHER
-    # seat only if seat identity is explicit: never mistake our own roster for
-    # the opponent's or treat remaining pool cards as drafted opponents.
-    rosters=obs.get('rosters')
-    if my_seat in (0,1):
-        other=1-my_seat
-        if isinstance(rosters,list) and len(rosters)>other:
-            collect(rosters[other])
-        elif isinstance(rosters,dict):
-            for key in (str(other),'player_'+str(other),'seat_'+str(other)):
-                if key in rosters:
-                    collect(rosters[key]);break
-    return list(dict.fromkeys(x for x in names if x))[:12]
-
-
-def _counter_score(species, opponents):
-    """Conservative type-only counter potential; neutral for unknown types."""
-    attack=_types_for(species)
-    if not attack or not opponents:
-        return 0.0
-    known=[x for x in opponents if _types_for(x)]
-    if not known:
-        return 0.0
-    totals=[]
-    for foe in known:
-        # Penalize Pokémon that have a severe defensive weakness and cannot
-        # threaten the enemy team. Account for both directions of matchup.
-        offensive=max(_type_multiplier(t,foe) for t in attack)
-        defensive=max(_type_multiplier(t,species) for t in _types_for(foe))
-        totals.append(13*(offensive-1)-10*(defensive-1))
-    totals.sort(reverse=True)
-    return max(-25.0,min(35.0,sum(totals[:2])/max(1,len(totals[:2]))))
-
-
-class CounterDraftPokemon(MatchupHybridPokemon):
-    """Bring matchup-aware roster information into the AI's legal alternatives."""
-    def choose_action(self, state, context):
-        self._my_seat = getattr(context,'seat_position',None)
-        return super().choose_action(state,context)
-
-    def _alternatives(self,state):
-        if not state.legal_actions:
-            return []
-        first=state.legal_actions[0]
-        obs=state.raw.get('observation') if isinstance(state.raw,dict) else {}
-        obs=obs if isinstance(obs,dict) else {}
-        opp=_opponent_species(obs, getattr(self,'_my_seat',None))
-        if first.action_id.startswith('draft_pick:'):
-            # Generate ALL legal cards; don't discard a counter-pick before
-            # its matchup value has been evaluated (old code kept top seven).
-            pool={str(x.get('card_id')):x for x in obs.get('available_cards',[]) if isinstance(x,dict)}
-            have=list(self.drafted_species)
-            have_types=[_types_for(x) for x in have]
-            options=[]
-            for action in state.legal_actions:
-                card=pool.get(action.action_id.partition(':')[2],{})
-                species=card.get('species') or action.label or action.action_id
-                types=_types_for(species)
-                role=_name(species)
-                utility=_species_score(species)+_counter_score(species,opp)
-                if role in {'tornadus','whimsicott','murkrow'}:
-                    utility+=12 if not any(_name(x) in {'tornadus','whimsicott','murkrow'} for x in have) else -15
-                if role in {'incineroar','rillaboom','ironhands'}:
-                    utility+=10 if not any(_name(x) in {'incineroar','rillaboom','ironhands'} for x in have) else -6
-                if types and have_types:
-                    utility-=4*sum(bool(set(types)&set(t)) for t in have_types)
-                options.append({'action':action,'utility':utility,
-                    'description':f'Draft {species}; counter score {_counter_score(species,opp):+.1f}; '
-                                  f'opponent known={opp}; our roster={have}; card={_compact(card,350)}'})
-            return sorted(options,key=lambda x:-x['utility'])[:9]
-        if first.action_id=='select_lineup' and opp:
-            template=first.input.get('action') or {}
-            roster=list(dict.fromkeys(template.get('roster') or []))
-            if len(roster)>=4:
-                validator=lineup_choice(first,state)
-                candidates=[]
-                for bring in itertools.combinations(roster,4):
-                    score=sum(_species_score(x)+_counter_score(x,opp) for x in bring)
-                    score-=6*sum(1 for a,b in itertools.combinations(bring,2)
-                                  if _types_for(a) and set(_types_for(a))==set(_types_for(b)))
-                    for leads in itertools.combinations(bring,2):
-                        utility=score+0.7*sum(_counter_score(x,opp) for x in leads)
-                        if any(_name(x) in {'tornadus','whimsicott','murkrow'} for x in leads):utility+=9
-                        try:
-                            action=validator.build({'bring':list(bring),'leads':list(leads)})
-                        except InvalidChoice:
-                            continue
-                        candidates.append({'action':action,'utility':utility,
-                            'description':f'Bring {bring}; lead {leads}; opponents {opp}; '
-                                          f'team counter utility {utility:.1f}'})
-                if candidates:
-                    return sorted(candidates,key=lambda c:-c['utility'])[:9]
-        return super()._alternatives(state)
-
-
-class RiffoAgent:
-    """UCLA SDK entry point; one isolated instance per assigned game seat."""
-
-    def __init__(self, provider=None, *, log=print):
-        load_dotenv()
-        self.provider = ResilientProvider(provider if provider is not None else provider_from_env())
+    def __init__(self, provider=None, *, log=print, clock=time.monotonic):
         self.log = log
-        self.pokemon = CounterDraftPokemon(self.provider, log=log)
-        self.werewolf = HybridWerewolf(self.provider, log=log)
-        self.red_alert = EconomyFirstRedAlert(self.provider, log=log)
+        self.clock = clock
+        self.own_moves: list[dict] = []
+        self.pokemon_reference = PokemonReference()
+        self._opening_review_done = False
+        # Store active species across battle decisions to flag Fake Out misuse.
+        self._active_field_turns: dict[int, tuple[str, int]] = {}
+        self.wolf_teammates: set[int] = set()
+        self._known_role: str | None = None
+        super().__init__(provider or provider_from_env(),
+                         realtime_players={"red_alert": FastRedAlert},
+                         log=log, clock=clock)
 
-    def choose_action(self, state, context):
-        game_type = context.game_type or getattr(state, 'game_name', '')
-        if game_type.startswith('pokemon'):
-            return self.pokemon.choose_action(state, context)
-        if game_type == 'werewolf':
-            return self.werewolf.choose_action(state, context)
-        if game_type == 'red_alert':
-            return self.red_alert.choose_action(state, context)
-        # Future game types fall back to the official multi-game agent.
-        if not hasattr(self, '_generic'):
-            self._generic = LLMAgent(self.provider, log=self.log)
-        return self._generic.choose_action(state, context)
+    def _battle_warnings(self, prompt: dict) -> dict:
+        """Mechanics facts for the LLM, not a handcrafted move scorer.
 
-    def choose_message(self, state, context):
-        if context.game_type == 'werewolf':
-            return self.werewolf.choose_message(state, context)
-        if not hasattr(self, '_generic'):
-            self._generic = LLMAgent(self.provider, log=self.log)
-        return self._generic.choose_message(state, context)
+        The official adapter supplies current active species and legal moves.
+        Counting uninterrupted appearances avoids repeatedly using Fake Out,
+        which only flinches on a Pokemon's first turn on the field.
+        """
+        current: dict[int, tuple[str, int]] = {}
+        warnings: list[str] = []
+        slots = prompt.get('slots', []) if isinstance(prompt, dict) else []
+        recent = self.own_moves[-1] if self.own_moves else {}
+        previous = _dict(recent.get('action')) if recent.get('phase') == 'moving' else {}
+        for row in slots if isinstance(slots, list) else []:
+            if not isinstance(row, dict):
+                continue
+            slot = row.get('slot')
+            if type(slot) is not int or slot not in (0, 1):
+                continue
+            active = row.get('active')
+            if isinstance(active, dict):
+                active = active.get('species') or active.get('name')
+            species = _pokemon_id(active)
+            if not species:
+                # Forced replacement choices often describe an empty slot.
+                # Do not carry forward a stale species across a faint or switch.
+                continue
+            old = self._active_field_turns.get(slot)
+            turns = old[1] + 1 if old and old[0] == species else 1
+            current[slot] = (species, turns)
+            offered = [_pokemon_id(opt.get('move_id')) for opt in row.get('options', [])
+                       if isinstance(opt, dict) and opt.get('type') == 'move']
+            if 'fakeout' in offered and turns > 1:
+                warnings.append(f'Slot {slot} ({active}) has remained active for at least {turns} decisions: '
+                                'Fake Out will fail unless it left and re-entered; pick a different move.')
+            last = _dict(previous.get(f'slot_{slot}'))
+            if turns > 1 and last.get('type') == 'move' and _pokemon_id(last.get('move_id')) in ('protect', 'detect'):
+                if any(m in offered for m in ('protect', 'detect')):
+                    warnings.append(f'Slot {slot} ({active}) used Protect/Detect on its preceding action. '
+                                    'Consecutive Protect success is approximately 1/3 on the second attempt, '
+                                    'and drops further on additional consecutive attempts.')
+        self._active_field_turns = current
+        return {
+            'observed_active_field_turns': {str(k): {'species': v[0], 'consecutive_decisions_seen': v[1]}
+                                           for k, v in current.items()},
+            'strategic_warnings': warnings,
+            'scope': 'These facts concern only currently observed active Pokemon; unknown switches/abilities/items '
+                     'must not be inferred. All server-supplied moves remain selectable.'
+        }
 
-    def on_action_result(self, result, context):
-        if context.game_type == 'red_alert':
-            self.red_alert.on_action_result(result, context)
-        elif hasattr(self, '_generic'):
-            self._generic.on_action_result(result, context)
+    def _critical_battle_warning(self, action: dict) -> str | None:
+        """Check only two universal turn-to-turn mechanics after model choice.
+
+        All other strategic decisions belong to the model; this does not
+        implement a move database or score alternatives.
+        """
+        if not isinstance(action, dict) or action.get('type') != 'doubles_turn':
+            return None
+        previous = self.own_moves[-1] if self.own_moves else {}
+        last_action = _dict(previous.get('action')) if previous.get('phase') == 'moving' else {}
+        errors = []
+        for slot in (0, 1):
+            choice = _dict(action.get(f'slot_{slot}'))
+            if choice.get('type') != 'move':
+                continue
+            move = _pokemon_id(choice.get('move_id'))
+            current = self._active_field_turns.get(slot)
+            if current is None or current[1] <= 1:
+                continue
+            if move == 'fakeout':
+                errors.append(f'slot_{slot} {current[0]} Fake Out will fail; it did not just enter the field')
+            last = _dict(last_action.get(f'slot_{slot}'))
+            if move in ('protect', 'detect') and last.get('type') == 'move' and \
+                    _pokemon_id(last.get('move_id')) in ('protect', 'detect'):
+                errors.append(f'slot_{slot} {current[0]} is attempting consecutive Protect/Detect '
+                              'with about 1/3 chance on the second attempt')
+        return '; '.join(errors) if errors else None
+
+    def _wolf_info(self, state: Any, context: Any) -> tuple[str | None, int | None, set[int]]:
+        raw = _dict(getattr(state, "raw", {}))
+        obs = raw.get("observation", getattr(state, "observation", None))
+        me = _seat(raw.get("your_position"))
+        if me is None:
+            me = _seat(getattr(context, "seat_position", None))
+        role = _role(obs) or self._known_role
+        if role:
+            self._known_role = role
+        if role != "wolf":
+            return role, me, set()
+        if isinstance(obs, dict):
+            for key in ("wolf_teammate", "wolf_partner", "other_wolf", "other_wolves",
+                        "teammate_position", "teammates", "wolf_team", "wolves"):
+                val = obs.get(key)
+                if isinstance(val, dict):
+                    val = next((val[k] for k in ("members", "players", "positions", "seats") if k in val), val)
+                sources = val if isinstance(val, list) else [val]
+                for member in sources:
+                    who = _seat(member)
+                    if who is not None and who != me:
+                        self.wolf_teammates.add(who)
+        if isinstance(obs, str):
+            for m in re.finditer(r"(?:other wolf|wolf partner|wolf teammate|fellow wolf)\s*(?:is|:)?\s*Player\s*([0-6])", obs, re.I):
+                who = int(m[1])
+                if who != me:
+                    self.wolf_teammates.add(who)
+        gs = _dict(raw.get("game_state"))
+        if gs.get("phase") == "night_wolf" and me is not None:
+            offered = {_seat(getattr(a, "action_id", None)) for a in getattr(state, "legal_actions", [])}
+            offered.discard(None)
+            dead = _rows(gs.get("dead"))
+            if not dead and len(offered) == 5:
+                # With 2 wolves + 5 villagers, one excluded living seat other
+                # than ourselves is our packmate, based on *our own* legal list.
+                missing = set(range(7)) - offered - {me}
+                if len(missing) == 1:
+                    self.wolf_teammates |= missing
+        return role, me, set(self.wolf_teammates)
+
+    @staticmethod
+    def _private_checks(observation: Any) -> dict[int, str]:
+        """Only a seer's own private observation can certify investigations."""
+        if not isinstance(observation, dict) or _role(observation) != "seer":
+            return {}
+        answers: dict[int, str] = {}
+        for field in ("seer_results", "investigations", "investigation_results"):
+            value = observation.get(field)
+            if isinstance(value, dict):
+                rows = [{"player": k, "result": v} for k, v in value.items()]
+            else:
+                rows = _rows(value)
+            for row in rows:
+                who = _seat(row.get("player", row.get("target", row.get("position"))))
+                result = row.get("result", row.get("role", ""))
+                if isinstance(result, dict):
+                    result = result.get("role", result.get("result", ""))
+                result = str(result).lower().strip()
+                if who is not None and result in ("wolf", "werewolf", "villager", "seer"):
+                    answers[who] = "wolf" if "wolf" in result else "villager"
+        return answers
+
+    def choose_action(self, state: Any, context: Any):
+        kind = str(getattr(context, "game_type", "") or "")
+        if kind == "werewolf":
+            self._remember(state)
+            role, me, teammates = self._wolf_info(state, context)
+            gs = _dict(_dict(getattr(state, "raw", {})).get("game_state"))
+            candidates = list(state.legal_actions)
+            if role == "wolf":
+                safe = [a for a in candidates if _seat(a.action_id) not in teammates]
+                if safe:
+                    candidates = safe
+                elif teammates:
+                    self.log("[riffo6] Wolf: no safe candidate; retaining server legal list")
+                elif gs.get("phase") == "day_vote":
+                    self.log("[riffo6] Wolf teammate not identified; voting with incomplete private information")
+            elif role == "seer" and gs.get("phase") == "day_vote":
+                checks = self._private_checks(_dict(getattr(state, "raw", {})).get("observation"))
+                confirmed_wolves = [a for a in candidates if checks.get(_seat(a.action_id)) == "wolf"]
+                if confirmed_wolves:
+                    candidates = confirmed_wolves
+                else:
+                    permitted = [a for a in candidates if checks.get(_seat(a.action_id)) != "villager"]
+                    if permitted:
+                        candidates = permitted
+            if not candidates:
+                return WAIT
+            choice = _discrete_choice(candidates)
+            value, answer = self._ask(choice, state, context, counter="decision_calls")
+            if value is None:
+                value = choice.fallback()
+            summary = str(_dict(answer).get("reasoning_summary") or "Evidence-based Werewolf choice")[:220]
+            self.log(f"[riffo6] Werewolf {gs.get('phase', 'move')}: {getattr(value,'action_id',value)}")
+            return WithReasoning(value, summary)
+        result = super().choose_action(state, context)
+        if kind.startswith("pokemon"):
+            a = result.action if isinstance(result, WithReasoning) else result
+            self.own_moves.append({"phase": getattr(state, "phase", None), "action":
+                                   a if isinstance(a, dict) else getattr(a, "action_id", str(a))})
+            self.own_moves = self.own_moves[-7:]
+        return result
+
+    def choose_message(self, state: Any, context: Any):
+        if getattr(context, "game_type", "") != "werewolf":
+            return super().choose_message(state, context)
+        role, me, pack = self._wolf_info(state, context)
+        sent = super().choose_message(state, context)
+        if not isinstance(sent, SendMessage):
+            return sent
+        msg = sent.content
+        public = not getattr(sent, "recipients", [])
+        # Guard only obviously fabricated private facts or accidental public
+        # self-identification. General suspicions and rhetorical argument remain AI-led.
+        if public and role != "seer" and re.search(r"\b(I (?:am|was) (?:the )?seer|I investigated|my seer result)\b", msg, re.I):
+            self.log("[riffo6] Suppressed ungrounded public seer claim")
+            return TERMINATE_MESSAGING
+        if public and role == "wolf" and re.search(r"\b(I am (?:a )?(?:wolf|werewolf)|we are wolves)\b", msg, re.I):
+            self.log("[riffo6] Suppressed accidental public wolf reveal")
+            return TERMINATE_MESSAGING
+        if public and role == "wolf" and any(re.search(rf"\b(?:vote\s+(?:for|on|against)|lynch|eliminate)\s+Player\s*{t}\b", msg, re.I) for t in pack):
+            self.log("[riffo6] Suppressed vote request against wolf teammate")
+            return TERMINATE_MESSAGING
+        return sent
+
+    def _ask(self, choice: Any, state: Any, context: Any, *, counter: str):
+        kind = str(getattr(context, "game_type", "") or "")
+        if not kind.startswith("pokemon") and kind != "werewolf":
+            return super()._ask(choice, state, context, counter=counter)
+        raw = _dict(getattr(state, "raw", {}))
+        phase = getattr(state, "phase", "")
+        base = {
+            "game": kind, "your_seat": getattr(context, "seat_position", None),
+            "phase": phase, "decision": choice.kind,
+            "legal_options_and_instructions": choice.prompt,
+            "your_observation": raw.get("observation"),
+        }
+        if kind == "werewolf":
+            role, me, pack = self._wolf_info(state, context)
+            base.update({
+                "private_role": role, "your_player_number": me,
+                "known_wolf_teammates_PRIVATE": sorted(pack) if role == "wolf" else [],
+                "public_game_state": raw.get("game_state"),
+                "players": raw.get("players"),
+                "public_discussion": self._transcript[-28:],
+                "WARNING": "Names may be duplicated across seats. Trust Player numbers and explicit private facts. "
+                           "Previous public votes do not reveal current hidden roles."
+            })
+            system = (
+                "You are playing simplified seven-person Werewolf: 2 wolves, 1 seer, 4 villagers. "
+                "Maximize your side's chance to win using evidence and incentives, not fixed scripts. "
+                "Analyze actual votes, revealed dead roles, contradictions, seer results and role incentives. "
+                "Public chat is NOT verified evidence; opponents may lie. "
+                "If you are a wolf, protect your known partner, coordinate privately when valuable, and seek parity. "
+                "If you are the seer, use only your OWN private verified investigations as certain. "
+                "If you are a villager, reason from public evidence and coalition incentives. "
+                "Night 1 is peaceful, daytime plurality eliminates; 3 consecutive no-elimination days lose for villagers. "
+                "Votes for fellow wolves are harmful. In chat, cite concrete public evidence when available; "
+                "on Day 1 with no evidence, express uncertainty rather than fabricate witnessed actions. "
+                "Keep chat under 40 words. Never claim a fake seer investigation. "
+                "Choose ONLY a supplied legal action or discussion recipient. "
+                "Answer the exact required strict JSON schema; public reasoning_summary must not leak private roles."
+            )
+            limit, budget = 15000, 16 if choice.kind == "message" else 15
+        else:
+            if choice.kind == 'doubles_turn':
+                base['battle_mechanics'] = self._battle_warnings(choice.prompt)
+            reference = self.pokemon_reference.brief(raw.get("observation"), choice.prompt)
+            if reference["species"] or reference["moves"]:
+                base["verified_pokemon_reference"] = reference
+            base.update({
+                "public_game_information": {k: raw.get(k) for k in (
+                    "game_state", "time", "match_rules", "players", "field") if k in raw},
+                "our_recent_actions": self.own_moves[-6:],
+                "recent_events": self._transcript[-8:],
+            })
+            system = (
+                "You are an expert competitive Pokémon VGC doubles coach. You control one seat of a "
+                "snake draft, 4-of-6 preview, simultaneous two-Pokémon battle. "
+                "Reason from CURRENT legal choices and visible state, NOT from a short hardcoded rankings table. "
+                "During draft, build a synergistic team with speed control, coverage, priority, defense, "
+                "support, and responses to publicly observed opposing picks. Only assume actual known moves/items. "
+                "At preview, choose 4 and leads specifically to beat the opposing roster, including probable leads. "
+                "At battle, prioritize NOT LOSING two Pokemon in a turn: consider whether the opposing "
+                "leads can KO ours, and whether Protect, Fake Out or a switch is worth more than attacking. "
+                "Use verified_pokemon_reference for base typings and move power when present; "
+                "possible abilities are not confirmed, and Tera or temporary transformations override base types. If absent, "
+                "carefully check both types and never mistake 0.25x for neutral. "
+                "Fake Out only works on the user's first turn after entering the field; if that Pokemon "
+                "stayed in on previous turns, choosing Fake Out again wastes its action. "
+                "A second consecutive Protect/Detect has only about a 1/3 success probability; "
+                "never assume it works twice in a row. Check battle_mechanics warnings. "
+                "Do not automatically double Fake Out: compare damage and Protect when both opening "
+                "Pokemon are threatened; targets may avoid flinch because of items, abilities or field effects. "
+                "Consider opposing Trick Room and Tailwind modes at preview; offensive speed alone "
+                "is insufficient against Trick Room. Do not claim a type immunity if merely resisted. "
+                "At battle, reason about BOTH Pokémon jointly: Protect and switching, speed control, "
+                "likely opponent Protect/switch, type immunities, status, stat stages, HP, expected KOs, "
+                "field conditions, move recoil and self-debuffs. Do not spam a move into repeated Protect. "
+                "Do not automatically double-target if it overkills or leaves another threat unchecked. "
+                "Respect targets: +1/+2 opponents, -1/-2 your own side, 0 no target. "
+                "Prefer a solid legal move over a slow or speculative calculation. "
+                "Choose ONLY provided indexes/roster species and legal targets, and answer strict JSON. "
+                "Keep public reasoning_summary short and avoid claiming unknown events."
+            )
+            limit = 29000
+            budget = 9 if choice.kind == "choose_action" and phase == "draft" else (22 if choice.kind == "doubles_turn" else 24)
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": _json(base, limit)},
+        ]
+        deadline = self.clock() + budget
+        for attempt in range(2):
+            left = deadline - self.clock()
+            if left < 2.5:
+                break
+            setattr(self, counter, getattr(self, counter) + 1)
+            try:
+                answer = self._provider.complete_structured(
+                    messages, choice.kind, choice.schema,
+                    timeout=min(16.0, max(2.5, left - 0.7)))
+                value = choice.build(answer)
+                if kind.startswith('pokemon') and choice.kind == 'doubles_turn':
+                    obvious = self._critical_battle_warning(value)
+                    if obvious and deadline - self.clock() > 5.5:
+                        # Model-first correction, not a hardcoded replacement move.
+                        try:
+                            self.log('[riffo6.3] Tactical rule check: ' + obvious)
+                            fixed = self._provider.complete_structured([
+                                {'role': 'system', 'content': (
+                                    'Correct the VGC action using only the supplied legal options. '
+                                    'Fake Out cannot work after the Pokemon stayed in since a previous turn; '
+                                    'consecutive Protect is unreliable. Choose the best OTHER joint action '
+                                    'considering opponent targets, HP, moves, and field. Use the SAME schema.')},
+                                {'role': 'user', 'content': _json({
+                                    'mechanical_problem': obvious,
+                                    'legal_options_and_instructions': choice.prompt,
+                                    'observation': raw.get('observation'),
+                                    'original_selection': answer,
+                                    'battle_mechanics': base.get('battle_mechanics', {}),
+                                }, 18000)},
+                            ], choice.kind, choice.schema,
+                               timeout=min(4.5, deadline - self.clock() - 1.0))
+                            revised = choice.build(fixed)
+                            if not self._critical_battle_warning(revised):
+                                value, answer = revised, fixed
+                                self.log('[riffo6.3] Corrected risky battle action')
+                        except (ProviderError, InvalidChoice, ValueError, TypeError, KeyError, TimeoutError):
+                            self.log('[riffo6.3] Tactical correction unavailable; using validated original')
+                # Independent *model* critique, never a locally ranked shortlist.
+                # Only the preview and opening battle decision are reviewed to
+                # control API costs and protect the 420-second battle time bank.
+                if kind.startswith('pokemon'):
+                    opening = choice.kind == 'doubles_turn' and not self._opening_review_done
+                    reviewing = choice.kind == 'select_lineup' or opening
+                    if opening:
+                        self._opening_review_done = True
+                    if reviewing and deadline - self.clock() >= 8:
+                        review_schema = choice.schema
+                        review_input = {
+                            'phase': phase, 'legal_options_and_instructions': choice.prompt,
+                            'player_observation': raw.get('observation'),
+                            'verified_pokemon_reference': base.get('verified_pokemon_reference', {}),
+                            'first_decision': answer,
+                        }
+                        try:
+                            revision = self._provider.complete_structured([
+                                {'role':'system','content':(
+                                    'You are the independent VGC tactical reviewer. The first coach chose an action. '
+                                    'Before approving, check all probable opponent opening attacks, double KOs, '
+                                    'speed control, move typing, immunities, Protect and favorable switches. '
+                                    'In team preview consider which leads survive the probable opponent leads. '
+                                    'Correct a risky selection when justified, otherwise repeat the exact selection. '
+                                    'Return the SAME required schema; only server-offered legal choices are allowed.')},
+                                {'role':'user','content':_json(review_input, 25000)},
+                            ], choice.kind, review_schema,
+                            timeout=min(8.0, deadline-self.clock()-1.5))
+                            checked = choice.build(revision)
+                            if checked != value:
+                                self.log('[riffo6.1] Pokemon tactical review revised the initial decision')
+                            value, answer = checked, revision
+                        except (ProviderError, InvalidChoice, ValueError, TypeError, KeyError, TimeoutError):
+                            self.log('[riffo6.1] Pokemon tactical review unavailable; keeping valid original decision')
+                return value, answer
+            except (ProviderError, InvalidChoice, ValueError, TypeError, KeyError, TimeoutError) as exc:
+                self.log(f"[riffo6] {kind} {choice.kind} model/validation failed: {type(exc).__name__}")
+                messages.append({"role": "user", "content": "Invalid prior response. Reconsider only the supplied legal options and follow the schema exactly."})
+        return None, None
 
 
 def create_agent():
